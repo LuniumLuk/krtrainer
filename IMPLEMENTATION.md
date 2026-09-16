@@ -168,6 +168,35 @@ The fix, in `krcheat/gui/tkprobe.py`, is a **static verdict first**:
 Verified: `doctor`, `gui`, `--self-test` and the full test suite now produce **zero** new crash
 reports on a machine where the combination is known-bad.
 
+### The second failure mode, and a defect it exposed
+
+On this machine the pyenv interpreters (3.13.14, 3.14.3) have **no `_tkinter` at all** — the
+exact hazard §7.4 predicted for pyenv builds — while `/usr/bin/python3` (3.9.6) has the
+aborting Tk 8.5. Two interpreters, two different reasons the GUI cannot run, and the tool was
+installed under the pyenv one, so this path was exercised for real.
+
+It failed, and the failure was instructive: `krcheat gui` printed an **internal error with a
+traceback and exited 6**, because `krcheat/gui/__init__.py` imported `krcheat.gui.app` — which
+imports `tkinter` at module level — *before* the preflight could refuse. A missing optional
+dependency was surfacing as a bug in the tool.
+
+The fix is the ordering: `tkprobe.require()` now runs before any module that needs Tk, so the
+refusal stays a sentence and exit 1 whichever way Tk is broken. Two tests guard it — one calls
+the public entry point and asserts a `UsageError`, one runs the CLI in a subprocess and asserts
+**no traceback** appears.
+
+### Interpreter matrix, measured 2026-09-16
+
+| Interpreter | Version | `tkinter` | GUI | Test suite |
+| --- | --- | --- | --- | --- |
+| `/usr/bin/python3` (CLT) | 3.9.6 | Tk 8.5, aborts | refused (`abort()` avoided) | 161 tests, OK |
+| pyenv | 3.13.14 | absent | refused (no `_tkinter`) | 161 tests, OK (1 skipped) |
+| pyenv | 3.14.3 | absent | refused (no `_tkinter`) | 161 tests, OK (1 skipped) |
+
+3.9.6 is the documented floor and 3.14.3 is what `python3` now resolves to on this machine
+(`pyenv global` is `3.14`); both are covered, and the skipped test is the one that needs a Tk
+old enough to refuse statically.
+
 ---
 
 ## 6. Next steps, in the order the spec sets them

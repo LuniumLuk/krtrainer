@@ -920,9 +920,9 @@ def cmd_patch(ctx, args):
 
 
 def cmd_gui(ctx, args):
-    from krcheat.gui import app as gui_app
+    from krcheat.gui import run as gui_run
 
-    code = gui_app.run(ctx)
+    code = gui_run(ctx)
     result = Result(command="gui", exit_code=int(code))
     return result
 

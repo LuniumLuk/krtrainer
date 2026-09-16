@@ -36,7 +36,8 @@ Two properties of the macOS build make a *better* trainer possible:
 ## Running it
 
 The language floor is **Python 3.9** and there are **no dependencies**: the standard library
-only, for every tier and both front-ends.
+only, for every tier and both front-ends. Verified on **3.9.6**, **3.13.14** and **3.14.3** —
+the interpreters present on the reference machine.
 
 ```sh
 cd /path/to/krtrainer
@@ -53,6 +54,15 @@ krcheat doctor
 ```
 
 `pipx install .` works too, if `pipx` is present.
+
+Two things worth knowing about the console script:
+
+- `pip install --user` writes it to `~/.local/bin`, which is **not** on the default macOS
+  `PATH`. If `krcheat: command not found`, either add that directory to `PATH`
+  (`export PATH="$HOME/.local/bin:$PATH"`) or keep using `python3 -m krcheat`.
+- The script is bound to the interpreter that installed it (its shebang). Switching pyenv
+  versions later breaks it with a "bad interpreter" error; re-run the install, or use
+  `python3 -m krcheat`, which always uses the current interpreter.
 
 ### The commands you will use first
 
@@ -151,23 +161,24 @@ Beyond that:
 ## The GUI is unavailable on this machine (and that is handled)
 
 `krcheat gui` opens a tkinter front-end over the same `core/`, with the same safety model and no
-GUI-only operation. On the reference machine it **cannot run**, and the reason is worth knowing:
+GUI-only operation. On the reference machine it **cannot run**, for two different reasons
+depending on the interpreter — and both are reported rather than crashing:
 
-```
-Tk 8.5 is too old for macOS 15.7.9: starting it aborts the process
-("macOS 15 (1507) or later required, have instead 15 (1506) !")
-```
+| Interpreter | What it has | What happens |
+| --- | --- | --- |
+| `/usr/bin/python3` (3.9.6) | Tk **8.5**, built against an older SDK | `abort()` during window creation: `macOS 15 (1507) or later required, have instead 15 (1506) !` |
+| pyenv 3.13.14 / 3.14.3 | **no `_tkinter` at all** | `ModuleNotFoundError: No module named '_tkinter'` |
 
-That failure is an `abort()` inside Tk's C code — not a catchable Python exception — and macOS
-answers it with a **"Python quit unexpectedly" problem-report dialog**. Both `/usr/bin/python3`
-and the pyenv interpreter are affected (both use the CommandLineTools Tk 8.5), so no available
-interpreter can show a window.
-
-`krcheat gui` and `krcheat doctor` therefore **never start a Tk process** unless the version
-numbers say it is plausible:
+The first failure is an `abort()` inside Tk's C code — not a catchable Python exception — and
+macOS answers it with a **"Python quit unexpectedly" problem-report dialog**. Neither failure is
+allowed to reach the user as a crash:
 
 - `krcheat gui` refuses with exit 1 and an explanation, instead of aborting your run;
 - `doctor` reports the condition as a WARN, with the remedy;
+- the Tk preflight runs **before** any module that imports `tkinter`, so a missing `_tkinter` is
+a sentence rather than a traceback;
+- `krcheat gui` and `doctor` **never start a Tk process** unless the version numbers say it is
+plausible — probing an aborting Tk in a subprocess still pops the dialog, once per check;
 - `KRCHEAT_ALLOW_BROKEN_TK=1` overrides the check, for the unlikely case of a working Tk 8.5.
 
 To get a working GUI, install an interpreter built against Tk 8.6+ (a python.org installer, or

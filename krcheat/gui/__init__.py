@@ -24,7 +24,17 @@ from __future__ import annotations
 
 
 def run(ctx):
-    """Start the GUI. Imported lazily so `import krcheat.gui` never touches Tk."""
+    """Start the GUI.
+
+    The preflight runs **before** `krcheat.gui.app` is imported, because that module (and
+    `dialogs.py` and `worker.py`) import `tkinter` at the top level. An interpreter with no
+    `_tkinter` at all — pyenv builds frequently have none — would otherwise raise
+    `ModuleNotFoundError` out of the import and surface as an internal error with a
+    traceback, instead of the one sentence that explains it and names the remedy.
+    """
+    from krcheat.gui import tkprobe
+
+    tkprobe.require()
     from krcheat.gui.app import run as _run
 
     return _run(ctx)

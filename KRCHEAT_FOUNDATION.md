@@ -506,8 +506,8 @@ candidates in order and log which one succeeded.
 | `clang` | `/usr/bin/clang` — Apple clang 17.0.0, target `x86_64-apple-darwin24.6.0` |
 | `codesign` | `/usr/bin/codesign` (for ad-hoc signing the agent dylib) |
 | Xcode CLT | `/Library/Developer/CommandLineTools` |
-| `python3` | `3.9.6` (pyenv shim; also `/usr/bin/python3`) |
-| `tkinter` | **must be verified per-interpreter** — pyenv builds frequently omit `_tkinter` |
+| `python3` | `3.9.6` at `/usr/bin/python3`; `pyenv global` is `3.14` → `3.14.3` (re-measured 2026-09-16, after the review; `3.13.14` also installed) |
+| `tkinter` | **must be verified per-interpreter** — pyenv builds frequently omit `_tkinter`. Confirmed 2026-09-16: the pyenv 3.13/3.14 builds have **no `_tkinter`**, while `/usr/bin/python3` has Tk **8.5**, which `abort()`s on window creation (`macOS 15 (1507) or later required, have instead 15 (1506) !`). So no available interpreter can open a window here, and the abort is not catchable — the preflight must be static (§7.4, and `IMPLEMENTATION.md` §5) |
 | `frida` | **not installed** (only relevant to the optional transport C) |
 
 `python3 3.9` sets the language floor: the CLI must be **Python 3.9 compatible** (no `match`,

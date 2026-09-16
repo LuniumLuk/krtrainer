@@ -151,16 +151,45 @@ class TestNoTkProcessIsEverStarted(unittest.TestCase):
                 state=state_mod.State.load(),
                 log=log_mod.NullLogger(),
             )
-            from krcheat.gui import app as gui_app
+            # The public entry point, which is what the CLI calls. It must refuse before
+            # importing anything that needs tkinter, so a missing _tkinter is a message
+            # rather than a ModuleNotFoundError.
+            from krcheat import gui
 
-            with self.assertRaises(UsageError):
-                gui_app.run(ctx)
+            with self.assertRaises(UsageError) as caught:
+                gui.run(ctx)
+            self.assertIn("CLI", caught.exception.message)
         finally:
             if previous is None:
                 os.environ.pop("KRCHEAT_HOME", None)
             else:
                 os.environ["KRCHEAT_HOME"] = previous
             shutil.rmtree(home, ignore_errors=True)
+
+    def test_app_module_is_only_imported_after_the_preflight(self):
+        """Regression guard: importing tkinter first turns a refusal into a traceback."""
+        if tkprobe.verdict().get("usable"):
+            self.skipTest("Tk works here, so the import order does not matter")
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        source = (
+            "import sys, krcheat.gui as g\n"
+            "from krcheat.core import config, state, log, context\n"
+            "ctx = context.Ctx(config=config.Config.load(), state=state.State.load(),"
+            " log=log.NullLogger())\n"
+            "try:\n"
+            "    g.run(ctx)\n"
+            "except Exception as exc:\n"
+            "    print(type(exc).__name__, 'app' in sys.modules)\n"
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", source],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=root,
+            env=dict(os.environ, KRCHEAT_HOME=tempfile.mkdtemp(prefix="krcheat-test-home-")),
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode())
+        self.assertEqual(completed.stdout.decode().strip(), "UsageError False")
 
     def test_gui_module_is_not_imported_eagerly(self):
         # `import krcheat.gui` must not drag tkinter in: tiers 1-3 have no Tk dependency.
@@ -191,7 +220,9 @@ class TestCliGuiPath(unittest.TestCase):
             with contextlib.redirect_stderr(err):
                 code = cli.main(["gui", "--save-dir", savedir])
             self.assertEqual(code, 1)
-            self.assertIn("CLI", err.getvalue())
+            self.assertIn("GUI is optional", err.getvalue())
+            # A traceback here would mean the import order regressed (exit 6).
+            self.assertNotIn("Traceback", err.getvalue())
         finally:
             if previous is None:
                 os.environ.pop("KRCHEAT_HOME", None)

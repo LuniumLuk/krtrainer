@@ -7,10 +7,19 @@ name = "krcheat"
 version = "0.1.0"
 description = "Command-line trainer and save editor for Kingdom Rush on macOS"
 readme = "README.md"
-# Python 3.9 is the measured interpreter on the reference machine (foundation §7.4).
-# No runtime dependencies: the standard library only, for all tiers and both front-ends (§13).
+# Python 3.9 is the measured interpreter floor (foundation §7.4); the tool is verified on
+# 3.9.6, 3.13.14 and 3.14.3. No runtime dependencies: the standard library only, for all
+# tiers and both front-ends (§13).
 requires-python = ">=3.9"
 dependencies = []
+
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Operating System :: MacOS",
+]
 
 [project.scripts]
 krcheat = "krcheat.cli:main"
