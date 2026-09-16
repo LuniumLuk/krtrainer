@@ -118,6 +118,16 @@ text has been amended where it did, and the finding is named here so the change 
 | D16 | **Transport A calls the interposed originals directly, with per-thread guards and an explicit resolver as the fallback.** `dlsym` cannot reach an interposed function from an inserted library: measured on dyld 4, `RTLD_NEXT` returns NULL (an inserted image is first in the load order, so there is nothing "next"), while `RTLD_DEFAULT` and even a handle lookup on the defining framework return *the interposer*. A direct call works, because an interposing image is not interposed — but that is not the whole answer. The first version guarded the direct call with a single global flag, which made two threads' concurrent `luaL_newstate` calls look like recursion to each other and returned NULL from one of them; the game dereferenced that NULL state and **crashed**. The guards are now thread-local and per function, they never withhold a result, and a Mach-O symbol-table lookup resolves the original when a call genuinely is routed back. | §9.3, §11.1, §11.6 |
 | D17 | **Transport B's bootstrap shadows `main_globals.lua`.** Verified from the shipped bytecode: it is 119 bytes whose entire constant pool is `KR_PLATFORM`/`KR_TARGET`/`KR_GAME`, and `main.lua` loads it by name. A replacement therefore has an exact contract — return those constants and add nothing — and `install --check` makes the *game* answer the S2 question (whether the save directory's copy wins) instead of the tool assuming it. | §3.3, §9.3, §16.1 |
 
+### 2.3 What the running game changed (2026-09-17, live)
+
+Two decisions come from the first session against a real game, and both are cases where the tool
+must say "not implemented" rather than do something plausible.
+
+| # | Decision | Sections affected |
+| --- | --- | --- |
+| D18 | **`live speed` is not implemented on this build, and says so with the measurement.** No speed or time-warp field exists at runtime, and the debug-key mechanism the bytecode hints at is not installed (measured: `DBG_TIME_MULT`, `DEBUG_KEYS_ON` and `DBG_AUTO_SEND` are not globals). The one lead, `store.dt`, is documented rather than written, because guessing at the game's timing is exactly the kind of unverified write that D19 exists to prevent. | §6.3, §11.5 |
+| D19 | **`live god on` refuses by default; `--force` writes the guess.** `game_outcome` is `nil` while a level runs, so the sentinel is unverified, and six shipped modules — including gameplay code — read that field. A wrong value could end the level rather than protect it, which is a worse outcome than refusing. `live lives infinity` is the measured mechanism and needs no sentinel. | §6.3, §11.5 |
+
 ---
 
 ## 3. Target application profile
@@ -453,26 +463,71 @@ constants in the shipped bytecode:
 | `level_mode`, `level_idx`, `level_difficulty` | `all/debug_tools.lua`, `all/storage.lua` | current level identity |
 | `max_upgrade_level`, `locked_towers`, `locked_powers`, `locked_hero` | `kr1/data/levels/*_data.lua` | per-level restrictions |
 
-### 6.2 Access path — what is known and what is not
+### 6.2 Access path — **measured** (2026-09-17)
 
-**Known:** the field names, and that `all/debug_tools.lua` accesses them as
-`store.game.<field>` (the module references both `store` and `game` and then `lives_left`,
-`game_outcome`), and that `all/storage.lua` reads `levels`, `stars`, `last_level`,
-`last_victory` via `get_slot_progress`.
+The owner chain was the one thing this section could not settle from the bytecode, and the first
+live run against the real game settled it by failing. `all/debug_tools.lua` accesses the fields as
+`store.game.<field>`, which is a **debug-build** shape: in the release build there is no `store`
+global at all, and `live gold` answered
 
-**Not yet verified:** the exact global owner chain (e.g. whether the live object is reachable as
-`GAME`, `store.game`, or via a `director`/`gamestate` handle), and its field names at runtime.
-This is deliberately **not hard-coded**: `krcheat live probe` enumerates the global environment
-and the candidate tables at runtime and reports reachable paths, and the snippet library is
-built from that output (§11.5). This is the single most important step of milestone M0.
+```
+krcheat-once:2: attempt to index global 'store' (a nil value)
+```
 
-### 6.3 Speed / time warp
+`krcheat live probe` (2,882 reachable paths) and then `krcheat live eval` established the truth:
 
-`all/game.lua` contains the debug strings `"z/Z: time warp (%sx)"` and
-`"Lives checking OFF (store.game_outcome set)"`. This indicates (inference, to be confirmed by
-`probe`) that the debug build exposes a simulation speed multiplier and a life-check toggle.
-If they exist in the release build as plain fields, they are the cleanest way to implement
-speed-up and god-mode without touching entity health.
+| Chain | Status at runtime |
+| --- | --- |
+| `game.simulation.store` | **the live table** — holds `player_gold` and `lives` |
+| `store.game` | does not exist (the debug build's access shape) |
+| `game` | a module table: `game.player_gold` does not exist |
+
+Measured at the start of `level01`, difficulty 2:
+
+| Field | Value | Note |
+| --- | --- | --- |
+| `game.simulation.store.player_gold` | 195 (number) | the value the user reported, which is how this was confirmed |
+| `game.simulation.store.lives` | 20 (number) | **the** life counter |
+| `lives_left` | `nil` | does not exist on this build |
+| `initial_gold`, `initial_lives` | `nil` | do not exist |
+| `game_outcome` | `nil` during play | see §6.3 |
+| `restart_count`, `restarted` | `nil` | do not exist |
+| `level_name`, `level_idx`, `level_mode`, `level_difficulty` | `level01`, 1, 1, 2 | level identity |
+| `dt` | ~0.0166 (number) | per-frame delta the simulation steps with |
+
+**It is still not hard-coded.** The snippet library resolves the table at runtime by *trying*
+candidates and requiring the winner to actually hold `player_gold` or `lives` as a number, so a
+stale entry cannot attach an override to an unrelated table; the capture reports which entry won
+(`owner: "game.simulation.store"`), and `probe` remains the command that answers this for any
+build. The measured path is only the last-resort fallback, for the one-shot writes that run
+without a capture.
+
+### 6.3 Speed / time warp and god mode — **not available on the release build**
+
+Both mechanisms are real, and both are **debug-key features that the release build does not
+install**. The evidence, in the order it was gathered:
+
+1. `all/game.lua` contains `"z/Z: time warp (%sx)"`, `"Lives checking OFF (store.game_outcome
+   set)"`, `DBG_TIME_MULT`, `DEBUG_KEYS_ON` and `DBG_AUTO_SEND` as *adjacent* constants — one
+   cluster, the debug-key handler.
+2. At runtime, **none** of the plausible speed fields exists: `live eval` checked `time_scale`,
+   `timewarp`, `time_warp`, `speed_multiplier`, `game_speed`, `speed` on `game.simulation.store`,
+   `game.simulation` and `game`, and found none.
+3. The debug globals do not exist either: `DBG_TIME_MULT`, `DEBUG_KEYS_ON` and `DBG_AUTO_SEND`
+   are absent from `_G`, from `game` and from `game.simulation.store`. The constants ship; the
+   handler that would read them does not run.
+
+`game_outcome` is a separate case: it is `nil` while a level runs, but it is read by **six**
+shipped modules, including gameplay ones (`all/systems.lua`, `all-desktop/game_gui.lua`,
+`kr1/achievements_handlers.lua`). No value for it has been observed, so `live god on` **refuses by
+default** and explains why; `--force` writes the guess and `live god off` restores whatever was
+there. `live lives infinity` is the mechanism that is measured to work and needs no sentinel.
+
+`speed` therefore has no implementation on this build, and `live speed` says so with the
+measurement rather than a shrug. One lead is `store.dt` — the per-frame delta the simulation is
+stepped with — but writing it is an unverified guess about the game's timing, so it is documented
+rather than done. A real implementation belongs in tier 3 (§14).
+
 
 ---
 
@@ -1061,10 +1116,10 @@ recompilation. Initial set:
 
 | Snippet | Template (illustrative — exact owner paths are filled in after `probe`) |
 | --- | --- |
-| `gold_inf` | `local s = <owner> s.player_gold = 99999` |
-| `lives_inf` | `local s = <owner> s.lives_left = <n>` (and/or `s.lives`) |
-| `god_on` | disable life checking via `game_outcome` |
-| `speed` | set the `time warp` multiplier |
+| `gold_inf` | `local s = <owner> s.player_gold = 99999` — the owner is **resolved at runtime** and confirmed to hold `player_gold`, not assumed (§6.2) |
+| `lives_inf` | `local s = <owner> s.lives = <n>` — measured: `lives` is the field; `lives_left` does not exist and is never created |
+| `god_on` | disable life checking via `game_outcome` — **refused unless `--force`** (D19) |
+| `speed` | set the `time warp` multiplier — **not available on this build** (D18) |
 | `probe` | walk `_G`, `store`, `game`, report table shapes and scalar values |
 | `eval` | pass through user-supplied Lua |
 
@@ -1386,10 +1441,10 @@ tier 1 needs no transport at all.
 | --- | --- | --- | --- |
 | **S1** | Does the game accept a hand-edited slot? | change `gems` by hand, restart, observe | the new value is displayed; no slot-deleted warning |
 | **S2** | Is the save directory searched before the game source for `require` in LÖVE 0.10.1? | drop a shadow `main_globals.lua` (Lua source) into the save dir that writes a marker file | marker file appears ⇒ **Transport B collapses to "drop one file", M5 shrinks, M7 is demoted to backlog, and F15 is delivered by §9.8 rather than by bytecode patching** (see §19 H1) |
-| **S3** | Can we load a dylib into the game? | build a hello-world dylib, `DYLD_INSERT_LIBRARIES` launch, log a line | log line present in the agent log file |
-| **S4** | Which per-frame hook works? | try `SDL_GL_SwapWindow`, then `SDL_PollEvent`, then `Graphics::present` | a counter reaches ≥ 30 within one second |
-| **S5** | Is the main `lua_State` captured by interposing `luaL_newstate`? | log the pointer; sanity-check `lua_gettop` | non-null pointer, `lua_gettop` returns a small sane value |
-| **S6** | What is the owner path of `player_gold` / `lives`? | run `probe` and grep the dumped globals | a concrete, reachable path such as `store.game.player_gold`, **and** a read-back after a write that confirms the assignment took effect (see §18) |
+| **S3** | Can we load a dylib into the game? | build a hello-world dylib, `DYLD_INSERT_LIBRARIES` launch, log a line | log line present in the agent log file. **Answered, live**: the agent's constructor logged `injected into pid=33142` in a real session |
+| **S4** | Which per-frame hook works? | try `SDL_GL_SwapWindow`, then `SDL_PollEvent`, then `Graphics::present` | a counter reaches ≥ 30 within one second. **Answered, live**: the interposed present ticked to `frame=24000` in a real session |
+| **S5** | Is the main `lua_State` captured by interposing `luaL_newstate`? | log the pointer; sanity-check `lua_gettop` | non-null pointer, `lua_gettop` returns a small sane value. **Answered, live**: `attached: state=0x3543380` |
+| **S6** | What is the owner path of `player_gold` / `lives`? | run `probe` and grep the dumped globals | a concrete, reachable path, **and** a read-back after a write that confirms the assignment took effect (see §18). **Answered, live**: `game.simulation.store`, verified by a write → read-back → restore round trip (§6.2) |
 | **S7** | Does the game start outside Steam? | launch the executable directly | reaches the main menu (Steam features may be degraded) |
 | **S8** | Can `core/oracle.py` drive the shipped `Lua.framework` from Python via `ctypes`? | extract a data module to a temp dir, `luaL_loadbuffer` + `lua_pcall` it, dump the resulting table | the table round-trips to JSON and matches what `mine` would report. **Answers H5 and H6 directly**, and removes the §14 validation blocker (D4) |
 
@@ -1477,7 +1532,7 @@ that should already be stable.
 
 | Risk | Likelihood | Impact | Mitigation |
 | --- | --- | --- | --- |
-| Live owner path cannot be resolved cleanly (S6 fails) | medium | medium | fall back to (a) a broader `probe` that walks `_G` recursively, (b) `debug.getregistry()`/upvalue inspection from a Lua hook installed at game call sites, (c) enabling the shipped `all/debug_tools.lua` helpers |
+| Live owner path cannot be resolved cleanly (S6 fails) | **closed** | — | S6 was answered live: the owner is `game.simulation.store`, and the resolution is done at runtime by trying candidates and requiring the winner to hold the field, so a wrong guess fails loudly instead of writing into an unrelated table (§6.2) |
 | **The field resolves but assignment is a silent no-op** (state behind a proxy table or `__newindex`) | medium | medium | S6's pass criterion now requires a **read-back after the write**, not just a resolved path (§16.1); the snippet contract requires re-reading after setting |
 | **A hanging `always` snippet** | low | **high — unrecoverable** | prevented structurally, not mitigated: no user control flow in `always` snippets, `live eval` is `once`-only, heartbeat auto-clear (§11.6–11.7). After the fact there is no recovery but force-quit |
 | **S2 fails** — the save dir does not shadow the game source | medium | medium | the plan branches explicitly (§16.1): M7 is restored, F15 moves to tier 3 and inherits §14's risks. No other milestone depends on it |
@@ -1519,12 +1574,16 @@ If true, the consequences are larger than "Transport B gets cheaper" (D3):
 
 Resolve with spike S2, which runs first (§16.1).
 
-**H2 — the exact owner chain of the live level state.** See §6.2 / S6.
+**H2 — the exact owner chain of the live level state. ANSWERED** (2026-09-17, live): it is
+`game.simulation.store`, not the debug build's `store.game`. Fields, values and the resolution
+mechanism are in §6.2; the failure that revealed it, and the runtime discovery that replaced the
+hard-coded guess, are in §6.2 and §11.5.
 
-**H3 — the release-build availability of debug hooks.** `all/debug_tools.lua` and the `time
-warp` / `game_outcome` strings exist in the shipped bytecode, but `DEBUG` is false in the
-release build. Whether the underlying fields are still present and writable must be checked by
-`probe`.
+**H3 — the release-build availability of debug hooks. ANSWERED, and the answer is no.**
+`all/debug_tools.lua` and the `time warp` / `game_outcome` strings ship in the bytecode, but the
+fields behind them do not exist at runtime: `DBG_TIME_MULT`, `DEBUG_KEYS_ON` and `DBG_AUTO_SEND`
+are absent from `_G`, `game` and the live table, and no speed field of any name exists. God mode
+is refused by default for the same reason — see §6.3, D18 and D19.
 
 **H4 — semantics of `difficulty = 1`.** Whether the stored value is 1-based over
 `DIFFICULTY_EASY|NORMAL|HARD|IMPOSSIBLE`, or offset. Verify by setting difficulty in-game and

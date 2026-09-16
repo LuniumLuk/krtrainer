@@ -53,20 +53,37 @@ JSON_PRELUDE = 'local json = require("lib.json")\n'
 #: Words that would make an `always` snippet a hang waiting to happen.
 LOOP_KEYWORDS = ("while", "repeat", "goto", "for", "::")
 
-#: Owner expressions, in the order `probe` should confirm them (spike S6, §6.2).
-#: `store.game` is the documented access shape (`all/debug_tools.lua` uses it), but the
-#: exact chain is *not* hard-coded anywhere: the resolved path is cached in state.json
-#: and every snippet is generated from it at call time.
-OWNER_CANDIDATES = ("store.game", "_G.GAME", "_G.game", "GAME", "game")
-
 DEFAULT_GOLD_VALUE = 99999
 DEFAULT_LIVES_VALUE = 99
 
 #: What `god` writes into `game_outcome`. Inferred from the shipped debug string `"Lives
 #: checking OFF (store.game_outcome set)"` (§6.3) rather than verified against a running
-#: game, so it is one named constant: `probe` confirms it, and changing it is a one-line edit
-#: with no C and no recompilation (§11.5).
+#: game, so it is one named constant. Note that the field is `nil` during play on the tested
+#: build, so this writes a field the game does not currently set; see the note in `god_on`.
 GOD_SENTINEL = "true"
+
+#: The live state table, **measured against the running game** (kr1-desktop-6.4.46, at the start
+#: of level01): `game.simulation.store.player_gold == 195`, `lives == 20`.
+#:
+#: This is where the previous guess went wrong. §6.2 inferred `store.game` from the debug
+#: strings in `all/debug_tools.lua`, and the first live run against the real game answered
+#: `attempt to index global 'store' (a nil value)` — the release build nests the live table under
+#: the `game` module instead. Recorded with its evidence so it does not have to be re-derived.
+MEASURED_OWNER = "game.simulation.store"
+
+#: Candidate owner expressions, in preference order, as Lua expressions each evaluated under
+#: `pcall` (so `game.simulation.store` fails harmlessly where `game.simulation` is nil). The
+#: winner is chosen by **content** — it must hold `player_gold` or `lives` as a number — so a
+#: wrong entry cannot silently attach an override to an unrelated table and create a junk field.
+#: Discovery happens in the `capture`, which may loop; the per-frame half obeys `assert_safe`.
+OWNER_CANDIDATES = (
+    ("game.simulation.store", "game.simulation.store"),
+    ("store and store.game", "store.game"),
+    ("game.store", "game.store"),
+)
+
+#: The fields that identify the live table.
+OWNER_FIELDS = ("player_gold", "lives")
 
 NOT_FOUND = "json.encode({ ok = false, error = 'owner not found' })"
 
@@ -100,10 +117,6 @@ def _strip_strings_and_comments(code):
     return code
 
 
-def _owner(owner):
-    return owner or "store.game"
-
-
 def _num(value):
     """Render a Lua number: an int stays an int, a float keeps its point."""
     if isinstance(value, bool):
@@ -121,6 +134,122 @@ def _str(value):
 
 
 # ---------------------------------------------------------------------------
+# Getting the live table
+# ---------------------------------------------------------------------------
+#
+# Every snippet needs `s` — the table the game keeps its level state on — and the two ways of
+# getting it are different on purpose:
+#
+#   * a **capture** searches the candidates (it runs once, so a loop is free);
+#   * a **per-frame or one-shot** snippet takes what the capture stored, and otherwise falls back
+#     to the measured path *without looping*, because it must satisfy `assert_safe`.
+#
+# Naming the candidate to the user is part of the job: if the chain ever changes again, the report
+# should say which entry answered rather than leaving it to be inferred from a failure.
+
+
+def _resolve_fragment():
+    """Loop-free owner resolution, for the snippets that run every frame or only once.
+
+    The capture searches the candidates with a loop, which is fine because it runs once. Anything
+    that can be installed as a per-frame override cannot loop (`assert_safe`), so the same search
+    is **unrolled** here from the same candidate list — one source of truth, two shapes, no drift.
+
+    The content check is the important part: a candidate only wins if it actually holds
+    `player_gold` or `lives` as a number, so a stale entry in the list cannot attach an override to
+    an unrelated table and quietly create a junk field.
+    """
+    fields = " or ".join(
+        "type(candidate[" + _str(field) + "]) == 'number'" for field in OWNER_FIELDS
+    )
+    lines = [
+        "local function __krcheat_is_store(candidate)\n",
+        "  return type(candidate) == 'table' and (" + fields + ")\n",
+        "end\n",
+        "local s = __krcheat_store\n",
+    ]
+    for expression, _ in OWNER_CANDIDATES:
+        lines += [
+            "if s == nil then\n",
+            "  local ok, candidate = pcall(function() return " + expression + " end)\n",
+            "  if ok and __krcheat_is_store(candidate) then s = candidate end\n",
+            "end\n",
+        ]
+    return "".join(lines)
+
+
+def _apply_head(owner=None):
+    """The prologue of a snippet that writes: `s` is set, or the snippet returns an error."""
+    if owner:
+        return (
+            JSON_PRELUDE
+            + "local s = " + owner + "\n"
+            + "if s == nil then return " + NOT_FOUND + " end\n"
+        )
+    return (
+        JSON_PRELUDE
+        + _resolve_fragment()
+        + "if s == nil then\n"
+        + "  return json.encode({ ok = false, error = 'the live table could not be found: no "
+        "candidate holds player_gold or lives. Run: krcheat live probe' })\n"
+        + "end\n"
+    )
+
+
+def _capture_head(owner=None):
+    """The prologue of a capture: find the live table, remember it, and say which entry won."""
+    if owner:
+        return (
+            JSON_PRELUDE
+            + "local s = " + owner + "\n"
+            + "if s == nil then return " + NOT_FOUND + " end\n"
+            + "__krcheat_store = s\n"
+            + "__krcheat_owner = " + _str(owner) + "\n"
+        )
+    probes = "".join(
+        "    function() return " + expression + " end,\n" for expression, _ in OWNER_CANDIDATES
+    )
+    names = ", ".join(_str(name) for _, name in OWNER_CANDIDATES)
+    fields = " or ".join(
+        "type(candidate[" + _str(field) + "]) == 'number'" for field in OWNER_FIELDS
+    )
+    return (
+        JSON_PRELUDE
+        + "local probes = {\n"
+        + probes
+        + "}\n"
+        + "local names = { " + names + " }\n"
+        + "local s, owner = nil, nil\n"
+        + "for i = 1, #probes do\n"
+        + "  local ok, candidate = pcall(probes[i])\n"
+        + "  if ok and type(candidate) == 'table' and (" + fields + ") then\n"
+        + "    s, owner = candidate, names[i]\n"
+        + "    break\n"
+        + "  end\n"
+        + "end\n"
+        + "if s == nil then\n"
+        + "  return json.encode({ ok = false, error = 'no live table found holding player_gold or "
+        "lives; the owner chain has changed — run: krcheat live probe' })\n"
+        + "end\n"
+        + "__krcheat_store = s\n"
+        + "__krcheat_owner = owner\n"
+    )
+
+
+def _restore_head(owner=None):
+    """The prologue of a restore: the same resolution, without `lib/json`.
+
+    Restore runs when a cheat is turned off or the heartbeat expires, so it must not be able to
+    fail because the game's JSON module is unhappy (§11.7.3). It shares the resolution fragment
+    with the write path, which uses no library at all, and it never raises: if the table cannot be
+    found, the snippet simply reports that it had nothing to put back.
+    """
+    if owner:
+        return "local s = " + owner + "\n"
+    return _resolve_fragment()
+
+
+# ---------------------------------------------------------------------------
 # Templates
 # ---------------------------------------------------------------------------
 
@@ -130,12 +259,12 @@ def gold_infinity(value=DEFAULT_GOLD_VALUE, owner=None):
 
     The snippet re-reads the field after writing it, because "the path resolved but the
     assignment was a silent no-op" is a recorded risk (§18) — a proxy table or a
-    `__newindex` metamethod would otherwise look like success.
+    `__newindex` metamethod would otherwise look like success. With the owner chain now
+    *discovered* rather than assumed, that read-back is also what would catch a resolution that
+    picked the wrong table.
     """
     return (
-        JSON_PRELUDE
-        + "local s = " + _owner(owner) + "\n"
-        + "if s == nil then return " + NOT_FOUND + " end\n"
+        _apply_head(owner)
         + "s.player_gold = " + _num(value) + "\n"
         + "local readback = s.player_gold\n"
         + "if readback ~= " + _num(value) + " then\n"
@@ -149,34 +278,45 @@ def gold_infinity(value=DEFAULT_GOLD_VALUE, owner=None):
 def lives_infinity(value=DEFAULT_LIVES_VALUE, owner=None):
     """F2: the level life counter stops falling.
 
-    Both spellings are written: §6.1 lists `lives` and `lives_left` as separate identifiers
-    in the same modules, so whichever one this build reads is covered.
+    `lives` is the field that exists; `lives_left` does **not** on the tested build (measured:
+    `nil`). The earlier version wrote `lives_left` unconditionally, which created a field the
+    game never reads and left `lives` untouched — a cheat that reported success and did nothing.
+    `lives_left` is still written when it is already there, for builds that use that spelling,
+    and never created from nothing.
     """
     return (
-        JSON_PRELUDE
-        + "local s = " + _owner(owner) + "\n"
-        + "if s == nil then return " + NOT_FOUND + " end\n"
-        + "s.lives_left = " + _num(value) + "\n"
-        + "if s.lives ~= nil then s.lives = " + _num(value) + " end\n"
-        + "return json.encode({ ok = true, lives_left = s.lives_left, lives = s.lives })\n"
+        _apply_head(owner)
+        + "s.lives = " + _num(value) + "\n"
+        + "if s.lives_left ~= nil then s.lives_left = " + _num(value) + " end\n"
+        + "local readback = s.lives\n"
+        + "if readback ~= " + _num(value) + " then\n"
+        + "  return json.encode({ ok = false, wrote = " + _num(value)
+        + ", readback = readback, error = 'assignment did not take' })\n"
+        + "end\n"
+        + "return json.encode({ ok = true, lives = readback, lives_left = s.lives_left })\n"
     )
 
 
 def speed(multiplier, owner=None):
-    """F9: the shipped `time warp` multiplier (§6.3, H3).
+    """F9: the simulation multiplier — **not available on the tested build**.
 
-    The field name is *not* known — §6.1 does not list it, only the debug string `"z/Z: time
-    warp (%sx)"`. Rather than guessing one name and being wrong, the name is resolved once by
-    the `capture` half of the override, which is allowed to loop; this per-frame half then
-    reads the resolved name and contains no control flow at all (§11.6).
+    §6.3 inferred a time-warp field from the shipped debug strings. Measured against the running
+    release build, none of the plausible names exists on any of `game.simulation.store`,
+    `game.simulation` or `game`: `krcheat live eval` checked `time_scale`, `timewarp`,
+    `time_warp`, `speed_multiplier`, `game_speed`, `speed`, `simulation_speed` and
+    `game_speed_multiplier`, and found none of them.
+
+    So this template still resolves a field if one ever exists (the `capture` searches and
+    remembers it), and otherwise reports the measurement instead of pretending. The honest answer
+    is "not on this build", and tier 3 (`krcheat patch`) is where a real implementation would go.
     """
     return (
-        JSON_PRELUDE
-        + "local s = " + _owner(owner) + "\n"
-        + "if s == nil then return " + NOT_FOUND + " end\n"
+        _apply_head(owner)
         + "local field = __krcheat_speed_field\n"
         + "if field == nil then\n"
-        + "  error('the time-warp field has not been resolved; re-run the speed command')\n"
+        + "  return json.encode({ ok = false, error = 'this build has no simulation-speed field "
+        "(measured): none of ' .. table.concat(__krcheat_speed_names or {}, ', ') .. ' exists. "
+        "Use lives/gold, or tier 3 (krcheat patch).' })\n"
         + "end\n"
         + "s[field] = " + _num(multiplier) + "\n"
         + "return json.encode({ ok = true, field = field, value = s[field] })\n"
@@ -186,24 +326,26 @@ def speed(multiplier, owner=None):
 def god_on(owner=None):
     """F10: disable life checking via `game_outcome` (§6.3).
 
-    `true` is the sentinel. That is an inference from the debug string `"Lives checking OFF
-    (store.game_outcome set)"` rather than something verified, and `probe` is what confirms
-    it — which is why it is one constant, in one place, and not spelled into the template.
+    Marked unverified, and this is what "unverified" means concretely: `game_outcome` is `nil`
+    during play on the tested build, so nothing here can confirm that writing it turns life
+    checking off. The debug string that justifies the mechanism (`"Lives checking OFF
+    (store.game_outcome set)"`) ships in the release bytecode, but the code path around it is
+    debug-only as far as the archive shows. `lives infinity` is the mechanism that is *measured*
+    to work, and it needs no sentinel.
     """
     return (
-        JSON_PRELUDE
-        + "local s = " + _owner(owner) + "\n"
-        + "if s == nil then return " + NOT_FOUND + " end\n"
+        _apply_head(owner)
         + "s.game_outcome = " + GOD_SENTINEL + "\n"
-        + "return json.encode({ ok = true, game_outcome = tostring(s.game_outcome) })\n"
+        + "return json.encode({ ok = true, game_outcome = tostring(s.game_outcome), "
+        "verified = false })\n"
     )
 
 
 def state_read(fields, owner=None):
     """Read a fixed list of field names: used by `live status` and by read-back checks."""
-    out = [JSON_PRELUDE, "local s = ", _owner(owner), "\n", "local values = {}\n"]
+    out = [_apply_head(owner), "local values = {}\n"]
     for field in fields:
-        out.append("if s ~= nil then values[" + _str(field) + "] = s." + field + " end\n")
+        out.append("values[" + _str(field) + "] = s." + field + "\n")
     out.append("return json.encode({ ok = true, values = values })\n")
     return "".join(out)
 
@@ -305,6 +447,16 @@ SPEED_FIELDS = (
     "speed",
 )
 
+#: What to tell a user who asks for `speed`, with the measurement behind it rather than a shrug.
+SPEED_UNAVAILABLE_NOTE = (
+    "this build has no simulation-speed field: measured against the running release build, none "
+    "of {0} exists on game.simulation.store, game.simulation or game, and the debug-key time "
+    "warp does not exist at runtime either (DBG_TIME_MULT is a bytecode constant, not a global). "
+    "A real implementation belongs in tier 3 (`krcheat patch`). One lead is `store.dt`, the "
+    "per-frame delta the simulation steps with, but writing it is an unverified guess about the "
+    "game's timing, so it is documented rather than done."
+).format(", ".join(SPEED_FIELDS))
+
 
 def _capture_footer():
     """The tail of every capture: store the originals, then describe what was stored.
@@ -325,7 +477,8 @@ def _capture_footer():
         "    summary[name] = value\n"
         "  end\n"
         "end\n"
-        "return json.encode({ ok = true, key = __krcheat_key, captured = summary })\n"
+        "return json.encode({ ok = true, key = __krcheat_key, owner = __krcheat_owner,\n"
+        "                     captured = summary })\n"
     )
 
 
@@ -333,7 +486,9 @@ def capture_for(key, owner=None):
     """The `capture` snippet: record what `for_override(key)` is about to overwrite.
 
     Runs once, before the first write, and may use loops — this is where any resolution work
-    belongs, so the per-frame snippet can stay control-flow free (§11.6).
+    belongs, so the per-frame snippet can stay control-flow free (§11.6). The owner chain is
+    resolved here (and reported), because the *first* live run against the real game showed why
+    a hard-coded guess is not good enough: §6.2's `store.game` does not exist on this build.
     """
     if key == "speed":
         return _capture_speed(owner)
@@ -344,9 +499,7 @@ def capture_for(key, owner=None):
         "  __krcheat_fields[#__krcheat_fields + 1] = " + _str(name) + "\n" for name in fields
     )
     return (
-        JSON_PRELUDE
-        + "local s = " + _owner(owner) + "\n"
-        + "if s == nil then return " + NOT_FOUND + " end\n"
+        _capture_head(owner)
         + "local saved = { present = {}, values = {} }\n"
         + "__krcheat_saved = __krcheat_saved or {}\n"
         + "__krcheat_fields = {}\n"
@@ -364,16 +517,16 @@ def _capture_speed(owner):
     """`speed`'s capture doubles as the field resolver — the only loop the override needs."""
     candidates = ", ".join(_str(name) for name in SPEED_FIELDS)
     return (
-        JSON_PRELUDE
-        + "local s = " + _owner(owner) + "\n"
-        + "if s == nil then return " + NOT_FOUND + " end\n"
+        _capture_head(owner)
+        + "__krcheat_speed_names = { " + candidates + " }\n"
         + "local field = nil\n"
-        + "for _, name in ipairs({ " + candidates + " }) do\n"
+        + "for _, name in ipairs(__krcheat_speed_names) do\n"
         + "  if type(s[name]) == 'number' then field = name break end\n"
         + "end\n"
         + "if field == nil then\n"
-        + "  return json.encode({ ok = false, error = 'none of the known time-warp fields '\n"
-        + "    .. 'exist on this build; run: krcheat live probe' })\n"
+        + "  return json.encode({ ok = false, owner = __krcheat_owner,\n"
+        + "    error = 'this build has no simulation-speed field (measured): none of '\n"
+        + "      .. table.concat(__krcheat_speed_names, ', ') .. ' exists' })\n"
         + "end\n"
         + "__krcheat_speed_field = field\n"
         + "local saved = { present = {}, values = {} }\n"
@@ -386,9 +539,13 @@ def _capture_speed(owner):
 
 
 #: The fields each override writes, so the capture and the restore cannot disagree about them.
+#: Order matters for one reason only: the first entry is the one the capture requires to be a
+#: number, so it is the field that identifies the live table.
 FIELDS_FOR_OVERRIDE = {
     "gold": ("player_gold",),
-    "lives": ("lives_left", "lives"),
+    # `lives` first, because that is the one this build has; `lives_left` does not exist
+    # (measured) and is only recorded so a restore can put it back if some other build has it.
+    "lives": ("lives", "lives_left"),
     "god": ("game_outcome",),
     # `speed` is absent on purpose: its field name is discovered at capture time (§6.3), so
     # the capture and restore agree through `__krcheat_saved` rather than through a constant.
@@ -404,8 +561,8 @@ def restore_for(key, owner=None):
     """
     if key == "speed":
         return (
-            "local s = " + _owner(owner) + "\n"
-            "local saved = __krcheat_saved and __krcheat_saved[__krcheat_key]\n"
+            _restore_head(owner)
+            + "local saved = __krcheat_saved and __krcheat_saved[__krcheat_key]\n"
             "__krcheat_speed_field = nil\n"
             "if s == nil or saved == nil then return 'nothing to restore' end\n"
             "for name, value in pairs(saved.values) do\n"
@@ -423,8 +580,8 @@ def restore_for(key, owner=None):
         for name in fields
     )
     return (
-        "local s = " + _owner(owner) + "\n"
-        "local saved = __krcheat_saved and __krcheat_saved[__krcheat_key]\n"
+        _restore_head(owner)
+        + "local saved = __krcheat_saved and __krcheat_saved[__krcheat_key]\n"
         "if s == nil or saved == nil then return 'nothing to restore' end\n"
         "do\n"
         + body

@@ -18,7 +18,6 @@ krcheat play                       # the game, with the live channel attached
 krcheat live gold infinity         # 99999, re-applied every frame
 krcheat live gold off              # released, and the captured value restored
 ```
-
 ---
 
 ## Why this exists
@@ -258,7 +257,7 @@ krtrainer/
 │   │   ├── live/               # tier 2: protocol, snippets, transports, keeper
 │   │   └── patch/              # tier 3: backlog (M8)
 │   └── agent/                  # the injected dylib, its harness and its Makefile
-└── tests/                      # 244 tests, stdlib unittest
+└── tests/                      # 246 tests, stdlib unittest
 ```
 
 The CLI is the foundation: all behaviour lives in `core/`, and both `cli.py` and `gui/` are thin
@@ -270,9 +269,13 @@ only one implementation.
 ## Tests
 
 ```sh
-python3 -m unittest discover -s tests -t tests -v     # 244 tests
+python3 -m unittest discover -s tests -t tests -v     # 246 tests
 python3 -m krcheat --self-test                        # the same checks, in the shipped tool
 ```
+
+**Close the game before running the suite.** §15.3 refuses tier-1 writes while it runs, so about 20
+write-path tests fail with the same refusal the tool gives a user — correct behaviour, and a
+confusing thing to read in a test report.
 
 Layers, per the spec: **unit** (codec byte-identity over synthetic fixtures and over generated
 text, targeted edits, backup hash verification, config preservation, state invalidation, operation
@@ -296,20 +299,24 @@ or while building — both lists are in [`IMPLEMENTATION.md`](IMPLEMENTATION.md)
 | M0 — spikes | **S8 implemented**, and S3–S5 answered for the agent's mechanism by a harness; S1, S2, S6, S7 need the game running |
 | M1 — Tier 1 core + write path | **done** |
 | M2 — Tier 1 complete (F3–F8, `list`) + F15 generation | **done** |
-| M3 — the injected agent (channel, `probe`, `eval`, `status`) | **done** |
-| M4 — live commands and the override lifecycle (§11.7) | **done**, including `--keep` and the keeper (D11) |
+| M3 — the injected agent (channel, `probe`, `eval`, `status`) | **done**, and verified in the real game: state captured, frames ticking |
+| M4 — live commands and the override lifecycle (§11.7) | **done**, including `--keep` and the keeper (D11); `gold` and `lives` verified against a running game, write and restore |
 | M5 — Transport B (bootstrap module) | **mechanism done**; `install --check` lets the game answer S2, and `start()` refuses rather than half-working |
 | M6 — Packaging and docs | partial (`pyproject.toml`, this README, [`CHEATSHEET.md`](CHEATSHEET.md)) |
 | M7 — tkinter GUI (F16) | **written and opt-in** (`ui.enabled`), deferred by D10; unusable on this machine's Tk 8.5 |
-| M8 — Bytecode patcher | backlog, as designed |
+| M8 — Bytecode patcher | backlog, as designed — and now the sanctioned route for `speed`, which this build cannot do live (D18) |
 
-Two questions still need the game running, and are listed as spikes rather than assumptions:
-**S2** (save-directory `require` precedence in LÖVE 0.10.1 — it decides the shape of M5 and
-whether M8 is ever needed) and **S6** (the runtime owner chain of `player_gold` / `lives`, plus the
-sentinels `god` and `speed` use). Nothing *mechanical* is unverified: the agent, the channel, the
-override lifecycle and transport B's install path are all covered by tests that run without the
-game. Both open questions are in
-[open questions](KRCHEAT_FOUNDATION.md#19-open-questions).
+Feature state after the first live session: **gold and lives work**, with the restore verified;
+`live probe`, `eval` and `watch` work; **`speed` is not available** on this build (the release build
+installs no time-warp field — measured, D18) and **`god on` refuses by default** because the sentinel
+it would write is unverified and gameplay reads that field (D19). `lives infinity` is the measured
+way to make death impossible.
+
+Two questions still need the game running: **S1** (a hand-edited slot is accepted) and **S2**
+(save-directory `require` precedence — `krcheat install --check` asks the game directly). The live
+*value* questions are closed: the owner chain is `game.simulation.store`, measured and in the spec
+([§6.2](KRCHEAT_FOUNDATION.md)), and the debug-key mechanisms the bytecode hinted at are not
+installed at runtime ([§6.3](KRCHEAT_FOUNDATION.md)).
 
 `krcheat data set level …` generates its shadow module today, but its effect is **unverified
 until S2 passes** — the command says so on every run, and so does `krcheat install --check`.

@@ -467,6 +467,11 @@ def main(argv=None):
         return EXIT_INTERNAL
 
     _render(ctx, result, sys.stdout)
+    # Persist after every command, not only the tier-1 writes. The live channel keeps its request
+    # counter here, and without this a fresh process starts again at id 1 — which is how every
+    # `live` command once reported the previous command's result (D14). A second call is free:
+    # `State.save()` does nothing when nothing is dirty.
+    _persist(ctx)
     ctx.log.info(
         "command.end",
         command=command,
@@ -913,6 +918,48 @@ KEEP_NOTE = (
 )
 
 
+def _live_error(response):
+    """The agent's own words for why a request failed, for the user rather than the log."""
+    if response is None:  # pragma: no cover - the transport raises before this
+        return "no response"
+    return response.error or "the agent reported a failure with no message"
+
+
+def _live_applied(response):
+    """Did the *snippet* say it worked?
+
+    Two different questions, and conflating them hides real failures. The agent's `ok` means "the
+    snippet ran without raising a Lua error" — it knows nothing about the game. A snippet reports
+    its own verdict in its JSON result (`ok = false`), which is how `speed` says this build has no
+    field to write, and how `gold` says an assignment did not take. The CLI has to read that
+    verdict, or a cheat that did nothing reads as a cheat that worked.
+    """
+    if response is None or not response.ok:
+        return False
+    decoded = response.decoded()
+    if isinstance(decoded, dict) and decoded.get("ok") is False:
+        return False
+    return True
+
+
+def _live_failure_note(result, response):
+    """Explain a failure in whichever of the two places it was reported, and exit accordingly.
+
+    A snippet that refused — `speed` on a build with no such field, an assignment that did not
+    take — means the request could not be carried out, so the run exits 3 rather than 0 with a
+    warning. A script that only checks the exit code must not read "this build cannot do it" as
+    success.
+    """
+    decoded = response.decoded() if response is not None else None
+    if isinstance(decoded, dict) and decoded.get("error"):
+        result.warn(decoded["error"])
+    elif response is not None and not response.ok:
+        result.warn(_live_error(response))
+    result.ok = False
+    result.exit_code = EXIT_CHANNEL
+    return result
+
+
 def _live_transport(ctx, args, launch=False):
     """Resolve the transport and make sure there is a live channel behind it."""
     from krcheat.core.errors import ChannelUnavailable
@@ -929,7 +976,12 @@ def _live_transport(ctx, args, launch=False):
 
 
 def _keep_or_note(ctx, args, transport, keys, result):
-    """`--keep` spawns a keeper; otherwise say plainly when the override ends."""
+    """`--keep` spawns a keeper; otherwise say plainly when the override ends.
+
+    Only called when the override actually took effect. Saying "this is released when the
+    command exits" after a failure describes an override that was never registered, which is
+    how a refusal gets read as a success.
+    """
     from krcheat.core.live import keeper
 
     if getattr(args, "keep", False):
@@ -966,7 +1018,12 @@ def _live_value_command(ctx, args, key, value):
         snippets.assert_safe(code)
         response = transport.always(key, code, capture=capture, restore=restore)
         result.set(key=key, mode="always", agent=response.to_dict())
-        _keep_or_note(ctx, args, transport, [key], result)
+        if _live_applied(response):
+            _keep_or_note(ctx, args, transport, [key], result)
+        else:
+            # The capture resolved the table or it did not; either way the answer is the report,
+            # and there is no override to make promises about.
+            _live_failure_note(result, response)
         return result
 
     try:
@@ -1021,10 +1078,13 @@ def cmd_live(ctx, args):
             "agent_build": agent_mod.describe(getattr(ctx, "log", None)),
         }
         if args.prune:
-            removed = protocol.prune_channels()
+            # A minute, not `prune_channels`' conservative hour: an explicit `--prune` is a
+            # request to clean up now, and the only thing the age guard protects against is
+            # racing a process that has just been launched and has not written its log yet.
+            removed = protocol.prune_channels(min_age=60.0)
             payload["pruned"] = removed
             payload["channels"] = protocol.list_channels()
-            payload["stale_channels"] = len(protocol.stale_channels())
+            payload["stale_channels"] = len(protocol.stale_channels(min_age=60.0))
             result.note("pruned {0} abandoned channel(s)".format(len(removed)))
 
         if channels:
@@ -1128,7 +1188,11 @@ def cmd_live(ctx, args):
         snippets.assert_safe(code)
         response = transport.always("speed", code, capture=capture, restore=restore)
         result.set(key="speed", mode="always", value=multiplier, agent=response.to_dict())
-        _keep_or_note(ctx, args, transport, ["speed"], result)
+        if _live_applied(response):
+            _keep_or_note(ctx, args, transport, ["speed"], result)
+        else:
+            _live_failure_note(result, response)
+            result.note(snippets.SPEED_UNAVAILABLE_NOTE)
         return result
 
     if action == "god":
@@ -1139,11 +1203,35 @@ def cmd_live(ctx, args):
             result.set(key="god", mode="clear", agent=response.to_dict())
             result.note("god: released, and the captured game_outcome restored")
             return result
+        # Refused by default, and this is the honest position rather than caution for its own
+        # sake: the sentinel is a guess, `game_outcome` is read by six shipped modules including
+        # gameplay ones, and a value they misread could end the level. `lives infinity` is the
+        # mechanism that was measured to work, and it needs no sentinel.
+        if not ctx.force:
+            raise UsageError(
+                "god mode is not implemented on the tested build, on purpose. "
+                "`game_outcome` is nil while a level runs, so no value for it has been observed; "
+                "six shipped modules read that field, including gameplay code, so writing a "
+                "guessed value into it could end your level rather than protect it.\n"
+                "  What works, and is measured: `krcheat live lives infinity`, which holds the "
+                "life counter so it cannot reach zero.\n"
+                "  If you want to experiment anyway, `krcheat live god on --force` writes "
+                "{0} into it and `live god off` puts back whatever was there.".format(
+                    snippets.GOD_SENTINEL
+                )
+            )
         code, capture, restore = snippets.override_snippets("god")
         snippets.assert_safe(code)
         response = transport.always("god", code, capture=capture, restore=restore)
         result.set(key="god", mode="always", agent=response.to_dict())
-        _keep_or_note(ctx, args, transport, ["god"], result)
+        result.warn(
+            "god mode writes an unverified sentinel into game_outcome; if the level ends "
+            "unexpectedly, that is why. `live god off` restores it."
+        )
+        if _live_applied(response):
+            _keep_or_note(ctx, args, transport, ["god"], result)
+        else:
+            _live_failure_note(result, response)
         return result
 
     raise UsageError("unknown live action {0!r}".format(action))

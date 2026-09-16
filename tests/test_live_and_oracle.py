@@ -114,10 +114,21 @@ class TestSnippets(unittest.TestCase):
 class TestProtocol(unittest.TestCase):
     def setUp(self):
         self.home = tempfile.mkdtemp(prefix="krcheat-test-tmp-")
+        self.previous_tmpdir = os.environ.get("TMPDIR")
         os.environ["TMPDIR"] = self.home
+        # `tempfile` caches its answer for the life of the process, so a test that changes TMPDIR
+        # would otherwise decide where *later* tests look for a channel. The channel path itself
+        # no longer goes through `tempfile` (`protocol.channel_root` matches the agent), and this
+        # keeps the cache from leaking into anything else that does.
+        self.cached_tempdir = tempfile.tempdir
+        tempfile.tempdir = None
 
     def tearDown(self):
-        os.environ.pop("TMPDIR", None)
+        if self.previous_tmpdir is None:
+            os.environ.pop("TMPDIR", None)
+        else:
+            os.environ["TMPDIR"] = self.previous_tmpdir
+        tempfile.tempdir = self.cached_tempdir
         shutil.rmtree(self.home, ignore_errors=True)
 
     def test_always_and_clear_require_a_key(self):

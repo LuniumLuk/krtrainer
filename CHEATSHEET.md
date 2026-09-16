@@ -123,20 +123,32 @@ krcheat live gold infinity              # 99999, re-applied every frame
 krcheat live gold 5000                  # written once; the game keeps spending from it
 krcheat live gold off                   # release it AND restore the value captured at registration
 krcheat live lives infinity             # lives takes the same three forms
-krcheat live speed 3                    # per-frame multiplier
-krcheat live god on                     # stop the life counter from ending the level
-krcheat live eval "return store.game.player_gold"
+krcheat live eval "return game.simulation.store.player_gold"
 krcheat live watch                      # interactive Lua prompt, Ctrl-D to leave
 krcheat live off                        # release everything at once
 ```
 
 `<n>`, `infinity` and `off` mean the same three things for `gold` and `lives`: write once, hold it
-every frame, or release and restore. `speed` and `god` take a value and `off`.
+every frame, or release and restore. Both were verified against a running game, including the
+restore (`infinity` → 99999, `off` → back to 195).
 
-**`probe` first.** Field names are discovered, not guessed: `probe` enumerates the globals, and the
-owner chain it reports is what the snippets are generated from. `god` and `speed` use two sentinels
-that come from the shipped debug strings rather than from a running game, so they are the two worth
-checking with `probe` (`live god on` then `live status` is enough to see whether it took).
+**The live table is `game.simulation.store`** (measured, 6.4.46): `player_gold` and `lives` live
+there, and there is no `store` global at all — `store.game` is the *debug* build's shape. Nothing
+is hard-coded: `live probe` enumerates the globals, and the snippets resolve the table at runtime
+by trying candidates and requiring the winner to hold the field, so a wrong guess fails loudly
+instead of writing into an unrelated table. `live status` reports which entry answered.
+
+```sh
+krcheat live eval 'return game.simulation.store.lives'      # 20 at the start of level01
+krcheat live eval 'return { gold = game.simulation.store.player_gold }'
+```
+
+**Two features are not available on this build, and say so rather than pretending:**
+
+| Command | Status |
+| --- | --- |
+| `live speed <n>` | **no simulation-speed field exists** — measured: none of `time_scale`, `timewarp`, `time_warp`, `speed_multiplier`, `game_speed`, `speed` is present, and the debug-key time warp (`DBG_TIME_MULT`) is a bytecode constant with no runtime global. Refused with that reason, **exit 3** |
+| `live god on` | **refused by default, exit 1.** `game_outcome` is `nil` while a level runs, so no value for it has been observed, and six shipped modules (including gameplay code) read that field — a wrong value could end your level rather than protect it. `live lives infinity` is the measured way to make death impossible. `live god on --force` writes the guess anyway; `live god off` puts back whatever was there |
 
 **Loops are refused, on purpose.** `live eval` and `live watch` are `once`-only, and a per-frame
 snippet containing `while` / `for` / `repeat` / `goto` / `::` is rejected *before* it is sent. A loop
@@ -227,8 +239,7 @@ krcheat --json --slot 1 profile show               # → .result.profile
 
 ## Exit codes
 
-`0` ok · `1` usage · `2` not found · `3` channel unavailable (no game running, or not started by
-`krcheat play`) · `4` validation · `5` backup · `6` internal (a traceback is in the log)
+| `0` ok · `1` usage (including a deliberate refusal) · `2` not found · `3` channel unavailable (no game running, or not started by `krcheat play`) **or the request could not be carried out** · `4` validation · `5` backup · `6` internal (a traceback is in the log) |
 
 ---
 

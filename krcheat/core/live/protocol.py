@@ -25,7 +25,6 @@ import errno
 import json
 import os
 import shutil
-import tempfile
 import time
 from typing import Any, Dict, Optional
 
@@ -51,7 +50,17 @@ DEFAULT_HEARTBEAT_TIMEOUT = 10.0
 
 
 def channel_root():
-    return os.path.join(tempfile.gettempdir(), "krcheat")
+    """`<TMPDIR>/krcheat`, computed the way the agent computes it.
+
+    Deliberately *not* `tempfile.gettempdir()`: that function caches its answer for the life of
+    the process, and it falls back to a different directory than the agent does when `TMPDIR` is
+    unset (macOS would give `/var/folders/...`, while the C falls back to `/tmp`). Either
+    difference puts the CLI and the agent in different directories, where every request times out
+    for a reason nothing in the logs explains. This is the same expression as
+    `kr_ensure_channel`, and the test suite catches the divergence by mutating `TMPDIR` between
+    test modules.
+    """
+    return os.path.join(os.environ.get("TMPDIR") or "/tmp", "krcheat")
 
 
 def channel_dir(pid):

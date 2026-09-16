@@ -42,9 +42,12 @@ Feature status, per §8.1:
 | --- | --- |
 | F3 upgrades, F4 stars, F5 gems, F6 hero XP, F7 achievements, F8 `seen` | working |
 | F14 backup / restore / doctor | working |
-| F1 gold, F2 lives, F9 speed, F10 god, F11 eval, F12 probe | **implemented**; the field *paths* and the two sentinels still need `probe` against a running game (S6, H3/H4) |
+| F1 gold, F2 lives | **working, verified against the running game** — write, per-frame hold, and restore |
+| F9 speed | **not available on this build** — measured, and the command says so (D18) |
+| F10 god | **refused by default** — the sentinel is unverified and gameplay reads the field (D19) |
+| F11 eval, F12 probe | working, verified live |
 | F15 per-level data | generated; effect unverified pending S2 |
-| F13 bytecode patching | backlog (M8) |
+| F13 bytecode patching | backlog (M8) — and now the sanctioned route for `speed` |
 | F16 tkinter GUI | written; blocked by the interpreter's Tk |
 
 Anything unimplemented fails with **exit 3** and a sentence naming what is missing, never silently
@@ -160,10 +163,14 @@ Evidence kept for a real-save check, per §16.3: the `doctor` summary, the `writ
 the JSONL log (target, byte counts, SHA-256 before and after, changed-node count, snapshot id),
 and the game's own storage-layer log lines.
 
-**What still needs the game.** S1 (a hand-edited slot is accepted), S6 (the owner path of
-`player_gold`/`lives`, and the two sentinels `god` and `speed` use), S7 (launching outside Steam),
-and S3 end to end. Every one of those is a *value* question, not a mechanism question, and each is
-answerable with one command: `krcheat play`, then `live probe`.
+**What still needs the game.** S1 (a hand-edited slot is accepted) and S7 (launching outside
+Steam), plus S2 — which `krcheat install --check` now asks the game directly. The *value*
+questions are closed: S6 is answered and in the spec, and the two sentinels turned out not to exist
+at runtime (D18, D19).
+
+**Running the suite.** Close the game first. §15.3's gate refuses tier-1 writes while it runs, so
+~20 write-path tests fail with the same refusal the tool gives a user — correct behaviour, and a
+confusing thing to see in a test report.
 
 Evidence kept for a real-save check, per §16.3: the `doctor` summary, the `write.*` records in
 the JSONL log (target, byte counts, SHA-256 before and after, changed-node count, snapshot id),
@@ -349,4 +356,46 @@ thread-local counters reverted — a one-line change — `nulls=0` still passes,
 recovers the call. What fails is the assertion that the log contains no `routed back to us` line.
 Both measured, not assumed: that is why the test asserts the *cause* and not only the symptom, and
 why the agent reports its fallback resolution once per attach instead of leaving it to luck.
+
+### 8.2 First session against the running game (2026-09-17)
+
+Tier 2 had been verified against everything except the game. This is what the game itself said, and
+it corrected the specification twice.
+
+**Verified live, end to end** (game pid 33142, `level01`, difficulty 2, gold 195, lives 20):
+
+| What | Evidence |
+| --- | --- |
+| Injection and attachment | `injected into pid=33142` → `attached: state=0x3543380` |
+| The frame hook | `frame=600` … `frame=24000` in the agent's log, no re-entry, no crash |
+| The read path | `player_gold` read as **195**, matching what the user reported independently |
+| The write path and the override lifecycle | `live gold infinity` → 99999, `live status` showing `applied=True` and the captured original, `live gold off` → **195 restored** |
+| Capture-before-write | the capture reported `captured: {player_gold: 195}` — the *real* value, not the forced one |
+| `lives` | `lives infinity` → 99 with `lives_left` still `nil` (no junk field), `off` → 20 |
+| `probe` | 2,882 reachable paths, which is what made the owner chain findable |
+
+**Two things the game corrected:**
+
+| # | Finding | Why it mattered |
+| --- | --- | --- |
+| 15 | **The owner chain was wrong.** §6.2 inferred `store.game` from the debug strings in `all/debug_tools.lua`; the release build has no `store` global at all, and the first live command answered `attempt to index global 'store' (a nil value)`. The real table is `game.simulation.store`. | Every snippet would have failed against the real game. The fix is the one the design promised: a **runtime** resolution that tries candidates and requires the winner to hold `player_gold` or `lives` as a number, reported in the capture (`owner: "game.simulation.store"`), with the measured path only as a fallback for one-shot writes. A hard-coded guess would have been wrong a second time; a guess that validates itself cannot be silently wrong. |
+| 16 | **`lives_left` does not exist** on this build; `lives` does. The old `lives_infinity` wrote `lives_left` unconditionally and touched `lives` only if it already existed. | It would have **created a field the game never reads** and left the real counter untouched — a cheat that reports success and does nothing, which is the §18 risk realised. It now writes `lives` and only touches `lives_left` if it is already there. |
+| 17 | **The time-warp and god mechanisms are debug-key features the release build does not install.** `DBG_TIME_MULT`, `DEBUG_KEYS_ON` and `DBG_AUTO_SEND` are bytecode constants but not globals, and no speed field of any name exists; `game_outcome` is `nil` during play but read by six shipped modules including gameplay code. | `speed` is now refused with the measurement (D18) instead of being a plausible-looking no-op, and `god on` refuses by default because writing an unverified value into a field that gameplay reads could **end the level** rather than protect it (D19). |
+
+**Two problems found in the test suite, both while the game was running:**
+
+* `channel_root()` used `tempfile.gettempdir()`, which **caches** its answer and falls back
+  differently than the agent does when `TMPDIR` is unset. Running two test modules in one process,
+  one of which mutates `TMPDIR`, put the CLI and the agent in different directories. It now
+  computes the path exactly as `kr_ensure_channel` does.
+* Two CLI tests asserted the no-channel case, and `live gold infinity` **tried to work** when a game
+  was up — a test suite that edits somebody's live session is worse than a skipped test, so they
+  now skip, saying why.
+
+**The suite needs the game closed, by design.** With a game running, 20 tests fail with §15.3's
+refusal (`Close the game, or pass --force`) — the same answer the tool gives a user, and the
+correct one. Verified: 226 of 246 pass with the game up, and every failure is that gate or a
+knock-on effect of it (no snapshot was taken, so `backup list` is empty; no `write.snapshot` log
+record, and so on).
+
 

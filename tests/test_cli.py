@@ -230,20 +230,39 @@ class TestBackupAndDiagnostics(CliCase):
         code, _out, err = self.run_cli("config", "set", "nonsense.key", "1")
         self.assertEqual(code, 1)
 
+    def _live_channel_present(self):
+        """Is a game actually running with the agent right now?
+
+        These two tests describe what `live` does when there is **no** channel, and the honest
+        thing is to skip them when there is one. Writing them to pass either way would hide the
+        case they exist for, and running them against a live game would register overrides in
+        somebody's session — which is worse than a skipped test. (Found by running the suite
+        while a game was up: `live gold infinity` cheerfully tried to work.)
+        """
+        from krcheat.core.live import protocol
+
+        for channel in protocol.list_channels():
+            if channel.get("alive"):
+                return True
+        return False
+
     def test_live_status_reports_the_real_channel_state(self):
+        if self._live_channel_present():
+            self.skipTest("a game is running: this asserts the no-channel case")
         code, out, _err = self.run_cli("live", "status")
         self.assertEqual(code, 0)
-        # No game is running in the test environment, so the honest answer is "no channel"
-        # plus the reason. What must not happen is a note about an unbuilt milestone: the
-        # agent is implemented now, and status is how a user finds out what is missing.
+        # The honest answer is "no channel" plus the reason. What must not happen is a note about
+        # an unbuilt milestone: the agent is implemented now, and status is how a user finds out
+        # what is missing.
         self.assertIn("channel: no", out)
         self.assertIn("overrides: none", out)
         self.assertIn("agent:", out)
         self.assertNotIn("not built in this build", out)
 
     def test_live_gold_refuses_with_exit_3(self):
-        # Exit 3 is the channel-unavailable contract (§10.5). The reason is now that no game
-        # is running, not that the feature does not exist, and the message has to say what to
+        if self._live_channel_present():
+            self.skipTest("a game is running: this asserts the no-channel case")
+        # Exit 3 is the channel-unavailable contract (§10.5), and the message has to say what to
         # do about it.
         code, _out, err = self.run_cli("live", "gold", "infinity")
         self.assertEqual(code, 3)
