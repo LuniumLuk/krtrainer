@@ -25,12 +25,16 @@ code is a bug.
 | §10.7 (D9) | `core/paths.py` | **done** — `find_slots`, `resolve_slot` |
 | §16.2 | `core/selftest.py` | **done** — the regression guard behind `--self-test` |
 | §10 | `cli.py` | **done** — the whole documented surface, with renderers |
-| §11.2–11.3 | `core/live/protocol.py` | **done** — framing, atomic handoff, heartbeat |
-| §11.6 | `core/live/snippets.py` | **done** — templates plus the loop guard |
-| §11.1 | `core/live/transport*.py` | **interface only** — every transport reports its milestone |
+| §11.2–11.3 | `core/live/protocol.py` | **done** — framing, atomic handoff, one-shot responses, channel cleanup |
+| §11.6 | `core/live/snippets.py` | **done** — templates, the loop guard, and the capture/restore half of every override |
+| §11.1 | `core/live/transport.py` | **done** — the seam, `select`, `describe_all` |
+| §9.3, §11.1 | `core/live/transport_dylib.py` | **done** — transport A: build, launch, channel, overrides |
+| §9.3 | `core/live/agent.py` | **done** — building and locating the dylib, once per source revision |
+| §11.7.4 | `core/live/keeper.py` | **done** — the detached process behind `--keep` (D11) |
+| §9.3, §16.1 | `core/live/transport_patched.py` | **mechanism done, effect pending S2** — one generated `main_globals.lua`, and `install --check` to let the game answer the spike |
+| §11 | `agent/kr_agent.c` | **done** — M3/M4; verified by `tests/test_agent_integration.py` |
 | §14 | `core/patch/luajit.py` | **backlog** — `is_bytecode` only |
 | §9.5 (F16) | `gui/` | **written**, unusable on this machine's Tk 8.5 (see §5) |
-| §11 | `agent/kr_agent.c` | **not written** (milestone M3) |
 
 Feature status, per §8.1:
 
@@ -38,13 +42,14 @@ Feature status, per §8.1:
 | --- | --- |
 | F3 upgrades, F4 stars, F5 gems, F6 hero XP, F7 achievements, F8 `seen` | working |
 | F14 backup / restore / doctor | working |
+| F1 gold, F2 lives, F9 speed, F10 god, F11 eval, F12 probe | **implemented**; the field *paths* and the two sentinels still need `probe` against a running game (S6, H3/H4) |
 | F15 per-level data | generated; effect unverified pending S2 |
-| F1 gold, F2 lives, F9 speed, F10 god, F11 eval, F12 probe | not built (tier 2, M3) |
 | F13 bytecode patching | backlog (M8) |
 | F16 tkinter GUI | written; blocked by the interpreter's Tk |
 
-Anything unimplemented fails with **exit 3** and a sentence naming the milestone, never silently
-and never with a traceback.
+Anything unimplemented fails with **exit 3** and a sentence naming what is missing, never silently
+and never with a traceback. That now includes the honest refusal from transport B: installing it
+is real, but driving a session through it is not implemented, and `start()` says so.
 
 ---
 
@@ -101,9 +106,9 @@ disagreed with.
 ## 4. Verification
 
 ```sh
-python3 -m unittest discover -s tests      # 193 tests
-python3 -m krcheat --self-test             # 10 checks, in the shipped tool
-python3 -m krcheat doctor --oracle         # environment + a real VM load
+python3 -m unittest discover -s tests -t tests   # 244 tests
+python3 -m krcheat --self-test                   # 10 checks, in the shipped tool
+python3 -m krcheat doctor --oracle               # environment + a real VM load
 ```
 
 What the tests actually pin down:
@@ -119,9 +124,26 @@ What the tests actually pin down:
   out-of-range value, an unknown id, an absent hero, a nonexistent slot — each has a test.
 - **The oracle agrees with the parser** on the same text, reports int/float distinctly, and is
   sandboxed (`os` is unreachable).
-- **Snippets.** Every template encodes its result; the loop guard rejects `while`/`for`/`repeat`/
-  `goto`/`::` but ignores those words inside strings and comments; every template compiles in the
-  game's own LuaJIT.
+- **Snippets.** Every template encodes its result — except the restore half of each override,
+  which is asserted *not* to depend on `lib/json` (D13). The loop guard rejects
+  `while`/`for`/`repeat`/`goto`/`::` but ignores those words inside strings and comments; every
+  template compiles in the game's own LuaJIT.
+- **The live channel, against a real agent.** `tests/test_agent_integration.py` compiles the
+  dylib with the production builder, loads it into a separate process with
+  `DYLD_INSERT_LIBRARIES`, and drives the real file channel: the state is captured by
+  interposition, frames arrive through an interposed `SDL_GL_SwapWindow`, and the requests are
+  evaluated by the game's own LuaJIT 2.1. It covers `once` and `eval`, `always` winning against the
+  game's own writes, `clear` restoring the *captured* value rather than the forced one, replacing
+  an override re-capturing instead of restoring the cheat, a table-valued field surviving capture
+  and restore by reference, `speed` resolving its unknown field name at capture time, `status`
+  enumerating what is active, `clear_all`, the heartbeat auto-clearing, the watchdog killing every
+  shape of runaway loop, and both size caps.
+- **Transport B's bootstrap.** The generated module is compiled by the oracle and *run* in the
+  harness's LuaJIT (where `love` is absent, which is the hostile case that matters), returning the
+  game's three constants and leaking no globals. Install, idempotence, `--check`'s three verdicts,
+  and the refusal to delete a `main_globals.lua` we did not write are all tested.
+- **The keeper.** It exits when the game is gone, refuses a channel that does not exist, records
+  its pid, and reports a stale pidfile rather than pretending it is alive.
 - **Config and state.** Comments and unknown keys survive a rewrite; booleans and integers are
   type-checked; the cache invalidates on `version_string` change; a corrupt `state.json` is
   replaced rather than trusted.
@@ -129,7 +151,19 @@ What the tests actually pin down:
   guesses; a nonexistent slot is exit 2 and is never created.
 - **CLI end to end.** Exit codes 0/1/2/3/4 for the documented cases, `--json` shape, dry-run,
   snapshot creation, `log tail --event`, `--no-log`, `config` round trip, `data set`/`revert`.
+- **The cheatsheet agrees with the parser**: every command it shows exists, and every command
+  exists in the cheatsheet. This is a real guard, not a formality — the two drifted the moment
+  tier 2 landed.
 - **No Tk process is ever started** when the static verdict says Tk would abort (§5).
+
+Evidence kept for a real-save check, per §16.3: the `doctor` summary, the `write.*` records in
+the JSONL log (target, byte counts, SHA-256 before and after, changed-node count, snapshot id),
+and the game's own storage-layer log lines.
+
+**What still needs the game.** S1 (a hand-edited slot is accepted), S6 (the owner path of
+`player_gold`/`lives`, and the two sentinels `god` and `speed` use), S7 (launching outside Steam),
+and S3 end to end. Every one of those is a *value* question, not a mechanism question, and each is
+answerable with one command: `krcheat play`, then `live probe`.
 
 Evidence kept for a real-save check, per §16.3: the `doctor` summary, the `write.*` records in
 the JSONL log (target, byte counts, SHA-256 before and after, changed-node count, snapshot id),
@@ -189,28 +223,47 @@ the public entry point and asserts a `UsageError`, one runs the CLI in a subproc
 
 | Interpreter | Version | `tkinter` | GUI | Test suite |
 | --- | --- | --- | --- | --- |
-| `/usr/bin/python3` (CLT) | 3.9.6 | Tk 8.5, aborts | refused (`abort()` avoided) | 161 tests, OK |
-| pyenv | 3.13.14 | absent | refused (no `_tkinter`) | 161 tests, OK (1 skipped) |
-| pyenv | 3.14.3 | absent | refused (no `_tkinter`) | 161 tests, OK (1 skipped) |
+| `/usr/bin/python3` (CLT) | 3.9.6 | Tk 8.5, aborts | refused (`abort()` avoided) | full suite, OK |
+| pyenv | 3.13.14 | absent | refused (no `_tkinter`) | full suite, OK |
+| pyenv | 3.14.3 | absent | refused (no `_tkinter`) | full suite, OK |
 
-3.9.6 is the documented floor and 3.14.3 is what `python3` now resolves to on this machine
-(`pyenv global` is `3.14`); both are covered, and the skipped test is the one that needs a Tk
-old enough to refuse statically.
+3.9.6 is the documented floor and 3.14.3 is what `python3` resolves to on this machine
+(`pyenv global` is `3.14`). The live tests need `clang` and the game's `Lua.framework`; they skip,
+rather than fail, when either is absent.
 
 ---
 
-## 6. Next steps, in the order the spec sets them
+## 6. What is left
 
-1. **Spike S2** — drop a shadow `main_globals.lua` into the save directory and see whether LÖVE
-   loads it. Pass: M5 collapses to a file writer, M8 is never needed, and F15's meaning is
-   confirmed. Fail: F15 moves to tier 3.
-2. **Spike S1** — hand-edit a slot and confirm the game accepts it (the acceptance test for the
-   codec against the real storage layer).
-3. **Spike S6** — `probe` for the owner chain of `player_gold` / `lives`, with the read-back
-   check the risk register demands.
-4. **M3** — `krcheat/agent/kr_agent.c`: interpose `luaL_newstate` and `SDL_GL_SwapWindow`, then
-   the channel loop. The protocol, the snippets and the override lifecycle are already specified
-   and coded on the Python side, so M3 is native code and wiring, not design.
+Tier 1 and tier 2 are both built. What remains splits cleanly into "needs the game running" and
+"deliberately deferred":
+
+**Needs a running game** (each is one command, and none of them is a mechanism question):
+
+1. **S1** — hand-edit a slot and confirm the game loads it. The codec is verified against the
+   real VM; this verifies it against the real storage layer.
+2. **S6** — `krcheat play`, then `krcheat live probe`, `look for player_gold` in the output, then
+   set `snippets.OWNER_CANDIDATES`' winner in `state.json`. Everything downstream is already
+   generated from that path, so this is a data change.
+3. **The two sentinels** — what `god` writes into `game_outcome` (H3) and which of the candidate
+   names is the time-warp field (H4). Both are single constants in `snippets.py`, both were chosen
+   from the shipped debug strings, and both are reported by `probe`.
+4. **S7** — launching the bundle's executable directly, outside Steam.
+5. **S2** — `krcheat install`, launch the game once, `krcheat install --check`. The check is
+   built; only the game's answer is missing.
+6. **S3 end to end** — the injection is verified against a harness that links the game's own
+   `Lua.framework`; what is not yet verified is that it survives a real launch with the real
+   `love` binary.
+
+**Deferred on purpose:**
+
+7. **Transport B driving a session.** The bootstrap installs and the S2 verdict is recorded; the
+   request/response reader for a bootstrap-driven session is not wired, and `start()` refuses with
+   that sentence rather than half-working.
+8. **Level-change auto-clear** (§11.6) — off by default and not implemented; calibrating it needs
+   a running game, and getting it wrong would drop overrides mid-level.
+9. **M7 / the GUI** — deferred by D10. It shares `core/` and is opt-in, so nothing is blocked.
+10. **M8 / tier 3** — the bytecode patcher stays a backlog item unless S2 fails.
 5. **M7** — *deferred by D10.* The GUI is written, shares `core/` and is opt-in
    (`ui.enabled`), so nothing here blocks it; macOS use is CLI-only, and a front-end would be
    picked up only if that decision changes (and only after M3, since the live panel is the part
@@ -242,3 +295,25 @@ read-through of the whole tree) fixed these. Each has a regression test in
 Two things the review deliberately did **not** change: the no-op-writes-nothing behaviour (§3.1) and
 the refusal to auto-restore after a failed post-write verification (§3.4). Both are decisions, not
 oversights.
+
+---
+
+## 8. Review of 2026-09-17 — what building M3–M5 found
+
+Not a review pass this time: these were found *by writing the code and then trying to prove it
+worked*. Every one of them was invisible to inspection, and every one is now a test.
+
+| # | Finding | Why it mattered |
+| --- | --- | --- |
+| 1 | **The watchdog did not work.** A `while true do end` snippet hung the process with the guard installed, and `while i < 1e9 do i = i + 1 end` ran to completion in 2.5 s. | LuaJIT consults the instruction-count hook only in its interpreter; a compiled trace never returns to the dispatch loop. The one failure §11.6 says the design cannot undo was unprotected, and the guard *looked* installed. Fixed with `jit.off(chunk, true)` (D12), and pinned by a test over four loop shapes. |
+| 2 | **`dlsym` cannot reach an interposed function.** All three routes returned NULL or *us*. | The replacement could not call the original, so `luaL_newstate` returned NULL and the game would not have started. The fix is to call it directly, because an interposing image is not interposed (D16). |
+| 3 | **Response ids repeated, so every `live` command answered with the previous command's result.** | The counter only persisted through `ctx.state`, and fell back to 1. The response for request N-1 was read as the answer to request N — silently, with a plausible-looking value. Fixed by an in-memory monotonic counter (D14), and `write_request` now deletes the previous response. |
+| 4 | **The agent's change detector used seconds.** | Two requests of equal length written in the same second looked identical, so the second was never read and the caller timed out. Reachable in ordinary use: `live status` twice in a row. Fixed with nanosecond mtimes (D15). |
+| 5 | **The build recorded its own temp filename as the install name.** | Cosmetic until you look at `otool -L` *of the agent running in the game*, which then names a file that does not exist. Fixed with `-install_name`. |
+| 6 | **`State` has no `set`.** | Two call sites guessed the accessor and one swallowed the `AttributeError` in a bare `except`, so the request-id counter silently never persisted. The bare except was the real bug; it is now narrowed. |
+| 7 | **SDL installs signal handlers, so `SIGTERM` is ignored.** | Found because harness processes outlived their tests. The same behaviour means `krcheat play` could never have ended a game with a plain terminate: `stop(quit_game=True)` now escalates to `SIGKILL`. |
+| 8 | **The generated bootstrap indexed `_G` unguarded.** | It is loaded very early, and a game (or harness) where the globals table is not reachable yet must still get its three constants back. Found by running the module in a real VM with no LÖVE, which is why it is tested there and not merely compiled. |
+| 9 | **`live status` did not report the agent at all when the channel was down.** | A diagnostic that answers "is the agent built?" only on the happy path is not a diagnostic. It also printed every abandoned channel directory; `$TMPDIR` is not reaped as eagerly as §11.3 assumed, and one development session left 171 of them. Now: live channels only, a stale count, and `--prune`. |
+| 10 | **The cheatsheet and the parser had already drifted** the moment tier 2 landed. | Fixed by a test that checks both directions, plus the pre-existing guard that every sub-action has `help=` text (argparse hides actions without it). |
+| 11 | **`--check` would have declared spike S2 failed whenever it was run before the game had been started.** | "The game ignored our file" and "the game has not run yet" are different answers, and only one of them means the transport has to be rebuilt. Distinguished by comparing the game's own file writes against the install time. |
+| 12 | **The oracle opens no libraries, so a real module cannot run inside it.** | The bootstrap test had to move to the harness: `pcall` itself is missing in the oracle's sandbox. Worth recording, because the next person will reach for the oracle to run something and be puzzled by the error. |

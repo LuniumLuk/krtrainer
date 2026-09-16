@@ -233,9 +233,29 @@ def _check_state(workdir):
 
 def _check_snippets():
     problems = []
-    for name, code in snippets.all_templates().items():
-        if not code or "json.encode" not in code:
+    templates = snippets.all_templates()
+    for name, code in templates.items():
+        if not code:
+            problems.append("{0} is empty".format(name))
+            continue
+        if name.startswith("restore_"):
+            # Restore snippets must *not* depend on the game's JSON module: they are the ones
+            # that run when the user turns a cheat off, and an encoding failure there would
+            # leave the game holding a value we wrote (§11.7.3). Asserted, not assumed.
+            if "json" in code:
+                problems.append("{0} depends on lib/json, which restore must not".format(name))
+            continue
+        if "json.encode" not in code:
             problems.append("{0} does not encode its result".format(name))
+    for key in ("gold", "lives", "speed", "god"):
+        for name, code in (
+            ("capture_" + key, snippets.capture_for(key)),
+            ("restore_" + key, snippets.restore_for(key)),
+        ):
+            if name not in templates:
+                problems.append("{0} is not covered by all_templates()".format(name))
+            elif not code.strip():
+                problems.append("{0} is empty".format(name))
     for keyword in ("while true do end", "for i = 1, 10 do end", "repeat until true"):
         try:
             snippets.assert_safe(keyword)
@@ -252,9 +272,7 @@ def _check_snippets():
     return Gate(
         "snippet library",
         PASS,
-        "{0} templates; the loop guard rejects control flow (§11.6)".format(
-            len(snippets.all_templates())
-        ),
+        "{0} templates; the loop guard rejects control flow (§11.6)".format(len(templates)),
     )
 
 

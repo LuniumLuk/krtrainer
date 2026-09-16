@@ -21,8 +21,10 @@ This module is real today; what is missing is the agent on the other end (M3).
 
 from __future__ import annotations
 
+import errno
 import json
 import os
+import shutil
 import tempfile
 import time
 from typing import Any, Dict, Optional
@@ -34,10 +36,15 @@ MAX_RESPONSE_BYTES = 1024 * 1024
 MODE_ONCE = "once"
 MODE_ALWAYS = "always"
 MODE_CLEAR = "clear"
-MODES = (MODE_ONCE, MODE_ALWAYS, MODE_CLEAR)
+MODE_STATUS = "status"
+MODES = (MODE_ONCE, MODE_ALWAYS, MODE_CLEAR, MODE_STATUS)
 
 #: Override keys are short and stable so `live status` can enumerate them (§11.2).
 OVERRIDE_KEYS = ("gold", "lives", "speed", "god")
+
+#: `live status` asks the agent for its own override table, which is the only place the
+#: truth lives (§11.7.5).
+STATUS_CODE = "status"
 
 DEFAULT_TIMEOUT = 2.0
 DEFAULT_HEARTBEAT_TIMEOUT = 10.0
@@ -51,13 +58,26 @@ def channel_dir(pid):
     return os.path.join(channel_root(), str(int(pid)))
 
 
-def list_channels():
-    """Every channel directory that exists, newest first."""
+def pid_alive(pid):
+    """Is this process still around? `os.kill(pid, 0)` is the cheap, standard probe."""
+    try:
+        os.kill(int(pid), 0)
+    except OSError as exc:
+        if getattr(exc, "errno", None) == errno.EPERM:  # exists, but it is not ours
+            return True
+        return False
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _scan_channels(now=None):
     root = channel_root()
     try:
         names = os.listdir(root)
     except OSError:
         return []
+    now = time.time() if now is None else now
     out = []
     for name in names:
         if not name.isdigit():
@@ -66,11 +86,64 @@ def list_channels():
         if not os.path.isdir(path):
             continue
         try:
-            out.append({"pid": int(name), "path": path, "mtime": os.path.getmtime(path)})
+            mtime = os.path.getmtime(path)
         except OSError:
             continue
+        out.append(
+            {
+                "pid": int(name),
+                "path": path,
+                "mtime": mtime,
+                #: A channel outlives its process whenever the process dies without cleanup,
+                #: which is the normal case for a crash. "Alive" is therefore a property of
+                #: the *process*, not of the directory.
+                "alive": pid_alive(int(name)),
+                "age": max(0.0, now - mtime),
+            }
+        )
     out.sort(key=lambda item: item["mtime"], reverse=True)
     return out
+
+
+def list_channels(live_only=True):
+    """Channel directories, newest first.
+
+    Only live ones by default. `$TMPDIR` is not reaped as eagerly as §11.3 assumed, so a
+    session of development leaves a directory per harness run behind, and a diagnostic that
+    prints two hundred dead pids is worse than one that prints none. `live_only=False` is for
+    the code that cleans them up.
+    """
+    channels = _scan_channels()
+    if live_only:
+        channels = [item for item in channels if item["alive"]]
+    for item in channels:
+        item.pop("age", None)
+    return channels
+
+
+def stale_channels(min_age=0.0):
+    """Channels whose process is gone. `min_age` keeps very recent ones."""
+    return [
+        item
+        for item in _scan_channels()
+        if not item["alive"] and item["age"] >= float(min_age)
+    ]
+
+
+def prune_channels(min_age=3600.0):
+    """Delete channels left behind by dead processes. Returns the pids removed.
+
+    Age-gated, because a channel directory that is seconds old usually means a process is
+    still starting up and has not written its log yet — not that it is abandoned.
+    """
+    removed = []
+    for item in stale_channels(min_age=min_age):
+        try:
+            shutil.rmtree(item["path"])
+        except OSError:
+            continue
+        removed.append(item["pid"])
+    return removed
 
 
 class Channel(object):
@@ -130,12 +203,24 @@ class Channel(object):
     # -- framing -------------------------------------------------------------
 
     def write_request(self, request):
+        """Hand a request to the agent, atomically (§11.3).
+
+        The previous response is deleted *before* the request is renamed into place. Both
+        halves matter: the rename stops the agent reading a half-written request, and the
+        delete stops us reading the previous answer a second time. A response is consumed
+        exactly once, and the only way to guarantee that without cooperation from the other
+        side is to remove it at the moment a new question is asked.
+        """
         payload = request.to_json()
         blob = json.dumps(payload).encode("utf-8")
         if len(blob) > MAX_REQUEST_BYTES:
             raise ValueError(
                 "request is {0} bytes, above the {1} byte cap".format(len(blob), MAX_REQUEST_BYTES)
             )
+        try:
+            os.remove(self.out_path)
+        except OSError:
+            pass
         tmp = self.cmd_path + ".tmp"
         with open(tmp, "wb") as handle:
             handle.write(blob)
@@ -186,35 +271,64 @@ class Channel(object):
 
 
 class Request(object):
-    """One request (§11.2). `key` is required for `always` and `clear`."""
+    """One request (§11.2).
 
-    def __init__(self, code, mode=MODE_ONCE, key=None, request_id=None, label=None):
+    `key` is required for `always` and `clear`. `capture` and `restore` are the two snippets
+    that make an override reversible (§11.7): `capture` runs once, *before* the first write,
+    and stores the values the snippet is about to overwrite; `restore` runs on `clear` and
+    puts them back. They are separate snippets rather than something the agent infers,
+    because only the snippet library knows which fields a given override touches.
+
+    `heartbeat_seconds` is a hint the agent uses to time out overrides (§11.7.4): a CLI that
+    dies must not leave the game modified.
+    """
+
+    def __init__(self, code, mode=MODE_ONCE, key=None, request_id=None, label=None,
+                 capture=None, restore=None, heartbeat_seconds=None):
         if mode not in MODES:
             raise ValueError("unknown mode {0!r}".format(mode))
         if mode in (MODE_ALWAYS, MODE_CLEAR) and not key:
             raise ValueError("mode {0!r} requires a key".format(mode))
-        if mode == MODE_CLEAR:
+        if mode in (MODE_CLEAR, MODE_STATUS):
             code = None
         self.code = code
         self.mode = mode
         self.key = key
         self.id = request_id
         self.label = label
+        self.capture = capture
+        self.restore = restore
+        self.heartbeat_seconds = heartbeat_seconds
 
     def to_json(self):
-        return {"id": self.id, "mode": self.mode, "key": self.key, "code": self.code}
+        """A flat object of scalars: the agent parses this with a small hand-written
+        parser, so nothing here may be nested (§11.2)."""
+        payload = {"id": self.id, "mode": self.mode, "key": self.key, "code": self.code}
+        if self.capture is not None:
+            payload["capture"] = self.capture
+        if self.restore is not None:
+            payload["restore"] = self.restore
+        if self.heartbeat_seconds is not None:
+            payload["heartbeat_seconds"] = float(self.heartbeat_seconds)
+        return payload
 
     @classmethod
     def once(cls, code, request_id=None, label=None):
         return cls(code, mode=MODE_ONCE, request_id=request_id, label=label)
 
     @classmethod
-    def always(cls, key, code, request_id=None, label=None):
-        return cls(code, mode=MODE_ALWAYS, key=key, request_id=request_id, label=label)
+    def always(cls, key, code, request_id=None, label=None, capture=None, restore=None,
+               heartbeat_seconds=None):
+        return cls(code, mode=MODE_ALWAYS, key=key, request_id=request_id, label=label,
+                   capture=capture, restore=restore, heartbeat_seconds=heartbeat_seconds)
 
     @classmethod
     def clear(cls, key, request_id=None, label=None):
         return cls(None, mode=MODE_CLEAR, key=key, request_id=request_id, label=label)
+
+    @classmethod
+    def status(cls, request_id=None):
+        return cls(None, mode=MODE_STATUS, request_id=request_id, label="status")
 
 
 class Response(object):

@@ -21,6 +21,23 @@ House style note: these templates are assembled by concatenation rather than
 `str.format`, because every other line contains Lua braces and a mismatched `{{` would
 produce Lua that compiles but does the wrong thing. `krcheat --self-test` compiles every
 template in the game's own VM, which is what actually keeps this honest.
+
+**Every override is a triple.** Registering an `always` sends three snippets: the per-frame
+`code`, a `capture` that runs once *before* the first write, and a `restore` that runs on
+`clear` (§11.7). `override_snippets(key, value)` builds all three together, because a
+capture that does not match its restore is worse than no capture at all — it silently puts
+back the wrong value. Splitting them across two call sites is how that drift starts, so
+there is one call site.
+
+Two properties of the restore path are deliberate:
+
+* **It does not use `lib/json`.** The capture's *reported* summary is JSON, for `live
+  status`; the *stored* originals are kept as real Lua references in `__krcheat_saved`, keyed
+  by override key. That means a table-valued field can be restored exactly, and — the reason
+  that matters — restoring cannot fail because a JSON module was missing or a value was not
+  encodable. Restore is the one call that must always work.
+* **It is keyed by `__krcheat_key`,** which the agent sets around both snippets, so the same
+  template pair serves every override without the agent knowing any field names.
 """
 
 from __future__ import annotations
@@ -44,6 +61,12 @@ OWNER_CANDIDATES = ("store.game", "_G.GAME", "_G.game", "GAME", "game")
 
 DEFAULT_GOLD_VALUE = 99999
 DEFAULT_LIVES_VALUE = 99
+
+#: What `god` writes into `game_outcome`. Inferred from the shipped debug string `"Lives
+#: checking OFF (store.game_outcome set)"` (§6.3) rather than verified against a running
+#: game, so it is one named constant: `probe` confirms it, and changing it is a one-line edit
+#: with no C and no recompilation (§11.5).
+GOD_SENTINEL = "true"
 
 NOT_FOUND = "json.encode({ ok = false, error = 'owner not found' })"
 
@@ -124,7 +147,11 @@ def gold_infinity(value=DEFAULT_GOLD_VALUE, owner=None):
 
 
 def lives_infinity(value=DEFAULT_LIVES_VALUE, owner=None):
-    """F2: the level life counter stops falling."""
+    """F2: the level life counter stops falling.
+
+    Both spellings are written: §6.1 lists `lives` and `lives_left` as separate identifiers
+    in the same modules, so whichever one this build reads is covered.
+    """
     return (
         JSON_PRELUDE
         + "local s = " + _owner(owner) + "\n"
@@ -136,26 +163,39 @@ def lives_infinity(value=DEFAULT_LIVES_VALUE, owner=None):
 
 
 def speed(multiplier, owner=None):
-    """F9: the shipped `time warp` multiplier, if the release build keeps the field (H3)."""
+    """F9: the shipped `time warp` multiplier (§6.3, H3).
+
+    The field name is *not* known — §6.1 does not list it, only the debug string `"z/Z: time
+    warp (%sx)"`. Rather than guessing one name and being wrong, the name is resolved once by
+    the `capture` half of the override, which is allowed to loop; this per-frame half then
+    reads the resolved name and contains no control flow at all (§11.6).
+    """
     return (
         JSON_PRELUDE
         + "local s = " + _owner(owner) + "\n"
         + "if s == nil then return " + NOT_FOUND + " end\n"
-        + "local before = s.time_scale\n"
-        + "s.time_scale = " + _num(multiplier) + "\n"
-        + "return json.encode({ ok = true, before = before, after = s.time_scale })\n"
+        + "local field = __krcheat_speed_field\n"
+        + "if field == nil then\n"
+        + "  error('the time-warp field has not been resolved; re-run the speed command')\n"
+        + "end\n"
+        + "s[field] = " + _num(multiplier) + "\n"
+        + "return json.encode({ ok = true, field = field, value = s[field] })\n"
     )
 
 
 def god_on(owner=None):
-    """F10: disable life checking via `game_outcome` (§6.3)."""
+    """F10: disable life checking via `game_outcome` (§6.3).
+
+    `true` is the sentinel. That is an inference from the debug string `"Lives checking OFF
+    (store.game_outcome set)"` rather than something verified, and `probe` is what confirms
+    it — which is why it is one constant, in one place, and not spelled into the template.
+    """
     return (
         JSON_PRELUDE
         + "local s = " + _owner(owner) + "\n"
         + "if s == nil then return " + NOT_FOUND + " end\n"
-        + "local before = s.game_outcome\n"
-        + "s.game_outcome = { keep = true, previous = before }\n"
-        + "return json.encode({ ok = true, before = before })\n"
+        + "s.game_outcome = " + GOD_SENTINEL + "\n"
+        + "return json.encode({ ok = true, game_outcome = tostring(s.game_outcome) })\n"
     )
 
 
@@ -230,9 +270,7 @@ TEMPLATES = {
     "god_on": god_on,
     "probe": probe,
     "state_read": state_read,
-}
-
-#: Templates that may be installed as a per-frame override. These are the ones the loop
+}#: Templates that may be installed as a per-frame override. These are the ones the loop
 #: guard exists for, and they contain no control flow at all (§11.6).
 PER_FRAME = ("gold_inf", "lives_inf", "speed", "god_on", "state_read")
 
@@ -254,9 +292,165 @@ def for_override(key, value=None):
     raise UsageError("unknown override key {0!r} (known: gold, lives, speed, god)".format(key))
 
 
+#: Field names the `speed` override is allowed to claim (§6.3). The one that exists is
+#: remembered in `__krcheat_speed_field`; if none does, the override reports failure instead
+#: of pretending to work, because a speed override that silently does nothing is exactly the
+#: "assignment was a silent no-op" risk of §18.
+SPEED_FIELDS = (
+    "time_scale",
+    "timewarp",
+    "time_warp",
+    "speed_multiplier",
+    "game_speed",
+    "speed",
+)
+
+
+def _capture_footer():
+    """The tail of every capture: store the originals, then describe what was stored.
+
+    `__krcheat_saved` is a plain Lua table of real references — no JSON, no copy (§11.7). The
+    encoded summary is only for the human reading `live status`, so it deliberately flattens
+    anything that is not a scalar: a table has no useful JSON form and might be cyclic.
+    """
+    return (
+        "__krcheat_saved[__krcheat_key] = saved\n"
+        "local summary = {}\n"
+        "for i = 1, #__krcheat_fields do\n"
+        "  local name = __krcheat_fields[i]\n"
+        "  local value = saved.values[name]\n"
+        "  if type(value) == 'table' or type(value) == 'function' then\n"
+        "    summary[name] = '<' .. type(value) .. '>'\n"
+        "  else\n"
+        "    summary[name] = value\n"
+        "  end\n"
+        "end\n"
+        "return json.encode({ ok = true, key = __krcheat_key, captured = summary })\n"
+    )
+
+
+def capture_for(key, owner=None):
+    """The `capture` snippet: record what `for_override(key)` is about to overwrite.
+
+    Runs once, before the first write, and may use loops — this is where any resolution work
+    belongs, so the per-frame snippet can stay control-flow free (§11.6).
+    """
+    if key == "speed":
+        return _capture_speed(owner)
+    fields = FIELDS_FOR_OVERRIDE.get(key)
+    if fields is None:
+        raise UsageError("unknown override key {0!r}".format(key))
+    body = "".join(
+        "  __krcheat_fields[#__krcheat_fields + 1] = " + _str(name) + "\n" for name in fields
+    )
+    return (
+        JSON_PRELUDE
+        + "local s = " + _owner(owner) + "\n"
+        + "if s == nil then return " + NOT_FOUND + " end\n"
+        + "local saved = { present = {}, values = {} }\n"
+        + "__krcheat_saved = __krcheat_saved or {}\n"
+        + "__krcheat_fields = {}\n"
+        + body
+        + "for i = 1, #__krcheat_fields do\n"
+        + "  local name = __krcheat_fields[i]\n"
+        + "  saved.present[name] = s[name] ~= nil\n"
+        + "  saved.values[name] = s[name]\n"
+        + "end\n"
+        + _capture_footer()
+    )
+
+
+def _capture_speed(owner):
+    """`speed`'s capture doubles as the field resolver — the only loop the override needs."""
+    candidates = ", ".join(_str(name) for name in SPEED_FIELDS)
+    return (
+        JSON_PRELUDE
+        + "local s = " + _owner(owner) + "\n"
+        + "if s == nil then return " + NOT_FOUND + " end\n"
+        + "local field = nil\n"
+        + "for _, name in ipairs({ " + candidates + " }) do\n"
+        + "  if type(s[name]) == 'number' then field = name break end\n"
+        + "end\n"
+        + "if field == nil then\n"
+        + "  return json.encode({ ok = false, error = 'none of the known time-warp fields '\n"
+        + "    .. 'exist on this build; run: krcheat live probe' })\n"
+        + "end\n"
+        + "__krcheat_speed_field = field\n"
+        + "local saved = { present = {}, values = {} }\n"
+        + "__krcheat_saved = __krcheat_saved or {}\n"
+        + "__krcheat_fields = { field }\n"
+        + "saved.present[field] = true\n"
+        + "saved.values[field] = s[field]\n"
+        + _capture_footer()
+    )
+
+
+#: The fields each override writes, so the capture and the restore cannot disagree about them.
+FIELDS_FOR_OVERRIDE = {
+    "gold": ("player_gold",),
+    "lives": ("lives_left", "lives"),
+    "god": ("game_outcome",),
+    # `speed` is absent on purpose: its field name is discovered at capture time (§6.3), so
+    # the capture and restore agree through `__krcheat_saved` rather than through a constant.
+}
+
+
+def restore_for(key, owner=None):
+    """The `restore` snippet: put the captured values back and forget them (§11.7.3).
+
+    Deliberately free of `require("lib.json")` and of any error-prone work: this is the
+    snippet that runs when the user turns a cheat off or the heartbeat expires, and it has to
+    work even if the game's own modules are unhappy.
+    """
+    if key == "speed":
+        return (
+            "local s = " + _owner(owner) + "\n"
+            "local saved = __krcheat_saved and __krcheat_saved[__krcheat_key]\n"
+            "__krcheat_speed_field = nil\n"
+            "if s == nil or saved == nil then return 'nothing to restore' end\n"
+            "for name, value in pairs(saved.values) do\n"
+            "  if saved.present[name] then s[name] = value else s[name] = nil end\n"
+            "end\n"
+            "__krcheat_saved[__krcheat_key] = nil\n"
+            "return 'restored'\n"
+        )
+    fields = FIELDS_FOR_OVERRIDE.get(key)
+    if fields is None:
+        raise UsageError("unknown override key {0!r}".format(key))
+    body = "".join(
+        "  if saved.present[" + _str(name) + "] then s[" + _str(name) + "] = saved.values["
+        + _str(name) + "] else s[" + _str(name) + "] = nil end\n"
+        for name in fields
+    )
+    return (
+        "local s = " + _owner(owner) + "\n"
+        "local saved = __krcheat_saved and __krcheat_saved[__krcheat_key]\n"
+        "if s == nil or saved == nil then return 'nothing to restore' end\n"
+        "do\n"
+        + body
+        + "end\n"
+        "__krcheat_saved[__krcheat_key] = nil\n"
+        "return 'restored'\n"
+    )
+
+
+def override_snippets(key, value=None):
+    """(`code`, `capture`, `restore`) for one override — built together, on purpose.
+
+    A capture whose restore does not match it would put back the wrong value and look like
+    success, so the three are never assembled independently.
+    """
+    return (for_override(key, value), capture_for(key), restore_for(key))
+
+
 def all_templates():
-    """Every template, for the compile check in `--self-test`."""
-    return {
+    """Every template, for the compile check in `--self-test`.
+
+    Includes the capture/restore halves of every override: they run in the game too, and a
+    typo in one of them would only be discovered at the worst possible moment — during a
+    `clear`, when the user is trying to put the game back the way it was.
+    """
+    templates = {
         "gold_inf": gold_infinity(),
         "lives_inf": lives_infinity(),
         "speed": speed(2.0),
@@ -265,6 +459,10 @@ def all_templates():
         "state_read": state_read(["player_gold", "lives_left", "game_outcome"]),
         "eval": eval_snippet("return 1 + 1"),
     }
+    for key in ("gold", "lives", "speed", "god"):
+        templates["capture_" + key] = capture_for(key)
+        templates["restore_" + key] = restore_for(key)
+    return templates
 
 
 def per_frame_templates():

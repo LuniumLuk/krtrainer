@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from krcheat import cli
 from krcheat.core import paths
 
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "slot_synthetic.lua")
 
 NO_ORACLE = ["--no-oracle"]
@@ -229,16 +230,24 @@ class TestBackupAndDiagnostics(CliCase):
         code, _out, err = self.run_cli("config", "set", "nonsense.key", "1")
         self.assertEqual(code, 1)
 
-    def test_live_status_explains_the_missing_milestone(self):
+    def test_live_status_reports_the_real_channel_state(self):
         code, out, _err = self.run_cli("live", "status")
         self.assertEqual(code, 0)
-        self.assertIn("M3", out)
-        self.assertIn("unavailable", out)
+        # No game is running in the test environment, so the honest answer is "no channel"
+        # plus the reason. What must not happen is a note about an unbuilt milestone: the
+        # agent is implemented now, and status is how a user finds out what is missing.
+        self.assertIn("channel: no", out)
+        self.assertIn("overrides: none", out)
+        self.assertIn("agent:", out)
+        self.assertNotIn("not built in this build", out)
 
     def test_live_gold_refuses_with_exit_3(self):
+        # Exit 3 is the channel-unavailable contract (§10.5). The reason is now that no game
+        # is running, not that the feature does not exist, and the message has to say what to
+        # do about it.
         code, _out, err = self.run_cli("live", "gold", "infinity")
         self.assertEqual(code, 3)
-        self.assertIn("M3", err)
+        self.assertIn("krcheat play", err)
 
     def test_patch_scan_is_backlog(self):
         code, _out, err = self.run_cli("patch", "scan", "265")
@@ -322,10 +331,38 @@ class TestHelpSurface(unittest.TestCase):
             cli.build_parser().parse_args(["--help"])
         text = out.getvalue()
         for command in (
-            "doctor", "profile", "backup", "log", "config", "data", "live", "play",
+            "doctor", "profile", "backup", "log", "config", "data", "live", "agent", "play",
             "install", "uninstall", "repair", "patch", "self-test", "gui",
         ):
             self.assertIn(command, text)
+
+    def test_the_cheatsheet_only_names_commands_that_exist(self):
+        """The cheatsheet is a promise; this keeps it from drifting away from the parser.
+
+        Two directions, both cheap: every command must be mentioned somewhere, and every
+        `krcheat <word>` in the file must be a real command. Deliberately not a shell parser —
+        a token immediately after `krcheat` is only checked when it is a bare word, so
+        `krcheat --slot 1 profile show` is skipped rather than misread.
+        """
+        import re
+
+        with open(os.path.join(REPO_ROOT, "CHEATSHEET.md"), "r", encoding="utf-8") as handle:
+            text = handle.read()
+        parser = cli.build_parser()
+        commands = set()
+        for action in self._subparser_actions(parser):
+            commands.update(action.choices)
+
+        mentioned = set(re.findall(r"\bkrcheat\s+([a-z][a-z-]*)", text))
+        unknown = sorted(name for name in mentioned if name not in commands)
+        self.assertEqual(unknown, [], "the cheatsheet names unknown commands: {0}".format(unknown))
+
+        undocumented = sorted(
+            name
+            for name in ("live", "profile", "backup", "data", "config", "log", "doctor", "play")
+            if name not in text
+        )
+        self.assertEqual(undocumented, [], "missing from the cheatsheet: {0}".format(undocumented))
 
     def test_data_help_lists_its_actions(self):
         out = io.StringIO()

@@ -102,6 +102,22 @@ Recorded here so the rest of the document can be read against them. Each is norm
 | D9 | **Slot selection is explicit and never persisted.** `--slot N` is passed per call; within one trainer session the last explicit value is reused; the cache is cleared at every startup, and if no slot has been given the user is **asked**, never guessed at. | §9.7, §10.7 |
 | D10 | **macOS use is CLI-only, and F16 is deferred.** The tkinter wrapper stays in the tree as an optional renderer because it shares `core/` and costs nothing to keep, but it is **opt-in** (`ui.enabled`, default false) and no front-end work — no native port, no web UI — is planned. `doctor` therefore reports it as "not requested" rather than warning about a component nobody asked for. | §8.1, §9.5, §17, §20 |
 
+### 2.2 Design decisions (review of 2026-09-17, after building M3–M5)
+
+Recorded after the tier-2 implementation, from measurements rather than from the plan. Each is
+normative, and each one contradicts something that earlier sections state or imply — the earlier
+text has been amended where it did, and the finding is named here so the change is traceable.
+
+| # | Decision | Sections affected |
+| --- | --- | --- |
+| D11 | **An override lives exactly as long as a process asks for it, and `--keep` is how a user asks for longer.** §11.7.4's heartbeat makes a crashed CLI harmless, which also means `live gold infinity` ends when the command ends. `--keep` spawns a detached *keeper* (`core/live/keeper.py`) that owns only the heartbeat, exits when the game does, and releases the overrides when it is stopped. Without this, "infinity" would have been a one-command cheat, which is not what the word suggests. | §11.7 |
+| D12 | **The agent turns the JIT off for each snippet it runs, recursively, via `jit.off(chunk, true)`.** Measured: LuaJIT consults an instruction-count hook only in its interpreter, so a compiled loop is uninterruptible — `while i < 1e9 do i = i + 1 end` completed at full speed and `while true do end` hung the process, with the watchdog installed and apparently working. §11.6 called a hanging snippet the one failure the design cannot undo, so the mitigation is now structural rather than hoped for. Plain Lua 5.1 has no `jit` table and the count hook suffices there, so this is a no-op off LuaJIT. | §11.6 |
+| D13 | **Capture and restore never round-trip through JSON.** The captured originals are kept as Lua references in `__krcheat_saved`, keyed by override key; the capture's *report* is JSON, but the restore path requires no `lib/json` and no decoding. Restoration is what runs when a user turns a cheat off or the heartbeat expires, so it must not be able to fail for an encoding reason, and a table-valued field (`game_outcome`) cannot be restored through JSON at all. | §11.4, §11.7 |
+| D14 | **The response is deleted, not overwritten, when a request is written, and request ids are strictly increasing.** A caller that asks twice must not be able to read the first answer as the answer to the second question. Both halves are required: the id distinguishes responses, and the delete guarantees at most one is ever readable. This was a live bug — with ids that repeated, every `live` command reported the previous command's result. | §11.3 |
+| D15 | **The agent's change detector uses a nanosecond timestamp.** A seconds-resolution `mtime` plus a size is not a change detector: two requests written in the same second with equal-length bodies are indistinguishable, so the second is never read and the caller times out. That is reachable in ordinary use (`live status` twice in a row). | §11.3 |
+| D16 | **Transport A reaches the functions it interposes with plain direct calls, never `dlsym`.** Measured on dyld 4 from an inserted library: `dlsym(RTLD_NEXT, …)` returns NULL (an inserted image is first in load order, so there is nothing "next"), `dlsym(RTLD_DEFAULT, …)` and `dlsym(handle_of_the_defining_framework, …)` both return *the interposer*. The documented rule that makes this work is that an interposing image is not interposed, so its own direct reference is the original. | §9.3, §11.1 |
+| D17 | **Transport B's bootstrap shadows `main_globals.lua`.** Verified from the shipped bytecode: it is 119 bytes whose entire constant pool is `KR_PLATFORM`/`KR_TARGET`/`KR_GAME`, and `main.lua` loads it by name. A replacement therefore has an exact contract — return those constants and add nothing — and `install --check` makes the *game* answer the S2 question (whether the save directory's copy wins) instead of the tool assuming it. | §3.3, §9.3, §16.1 |
+
 ---
 
 ## 3. Target application profile
@@ -965,8 +981,9 @@ Request (Lua source to evaluate, plus correlation, mode and key):
 
 ```json
 { "id": 42, "mode": "once",   "key": null,   "code": "return json.encode({ gold = GAME.player_gold })" }
-{ "id": 43, "mode": "always", "key": "gold", "code": "<snippet>" }
+{ "id": 43, "mode": "always", "key": "gold", "code": "<snippet>", "capture": "<snippet>", "restore": "<snippet>", "heartbeat_seconds": 10.0 }
 { "id": 44, "mode": "clear",  "key": "gold", "code": null }
+{ "id": 45, "mode": "status", "key": null,   "code": null }
 ```
 
 `mode` is one of:
@@ -975,10 +992,20 @@ Request (Lua source to evaluate, plus correlation, mode and key):
 | --- | --- | --- |
 | `once` | ignored | evaluate now, return the result |
 | `always` | **required** | evaluate every frame until replaced or cleared (the "infinity"/checkbox behaviour). A second `always` with the same key **replaces** the first |
-| `clear` | **required** | remove a registered `always` snippet and restore the value captured when it was registered (§11.7) |
+| `clear` | **required** | remove a registered `always` snippet and restore the value captured when it was registered (§11.7). `key = "*"` clears every override |
+| `status` | ignored | report the agent's own override table (§11.7.5) — this is how `live status` answers "what is active right now" |
 
 The `key` is a short stable identifier (`gold`, `lives`, `speed`, `god`) and is what makes
 `live status` able to enumerate active overrides.
+
+`capture` and `restore` were added after implementation (D13). `always` alone is not enough to make
+an override reversible: only the snippet library knows which fields a given override touches, so
+the capture and the restore must be supplied alongside the code, and the agent runs the capture
+**before** the first write. The three are built together by `snippets.override_snippets(key)`,
+because a capture that disagrees with its restore is worse than no capture at all.
+
+`heartbeat_seconds` is how the CLI tells the agent how long a stale heartbeat may persist
+(§11.7.4); it is optional, and defaults to 10 s.
 
 Response:
 
@@ -998,7 +1025,13 @@ The response echoes `id` and `key`, and `error` carries the `lua_pcall` message 
   writing producer otherwise race, and a torn read surfaces as an intermittent parse failure
   that looks like an agent bug. The agent writes `out.json` by the same write-and-rename rule.
 * The agent `stat`s the channel directory once per frame (negligible) and acts only when the
-  entry changed.
+  entry changed. **"Changed" means (mtime, size) at nanosecond resolution** (D15): a
+  seconds-resolution timestamp plus a size is not a change detector, because two requests
+  written in the same second with bodies of the same length are indistinguishable — the second is
+  never read, and the caller times out. That is reachable in ordinary use.
+* **A new request deletes the previous response** (D14). A response must be readable exactly
+  once; combined with strictly increasing `id`s, that is what stops a caller from reading the
+  answer to its previous question as the answer to this one.
 * **Response size is capped** (e.g. 1 MiB) and truncated by the agent with a marker, so a
   `probe` dump cannot fill the channel or the caller's memory.
 * Latency target: one frame (≈16 ms at 60 fps) plus polling; CLI timeout default 2 s.
@@ -1050,9 +1083,17 @@ owns that).
   main thread and is **not recoverable** except by force-quitting the process — the channel
   cannot be used to fix it, because the code that would read the fix is the code that is
   hanging. This is the one live-channel failure the design cannot undo, so it is prevented
-  structurally: `always` snippets are built from fixed templates with no user-supplied control
-  flow, and `live eval` is `once`-only.
+  structurally at three levels: `always` snippets are built from fixed templates with no
+  user-supplied control flow (`snippets.assert_safe` refuses loop keywords outright), `live eval`
+  is `once`-only, and the agent runs every snippet under an instruction-count watchdog.
+* **The watchdog only works if the snippet is not JIT-compiled** (D12). The count hook is
+  consulted by LuaJIT's interpreter, and a compiled trace never returns to it. The agent
+  therefore calls `jit.off(chunk, true)` before running anything, which marks that chunk and the
+  prototypes inside it — and nothing else. Measured without it: a billion-iteration counter loop
+  ran to completion in 2.5 s and `while true do end` hung the process. With it: every shape of
+  runaway loop is killed in about 0.3 s and the agent keeps answering afterwards.
 * Overrides are cleared on level change detection (configurable) to avoid surprising carry-over.
+  *Not implemented*; it is off by default and needs a running game to calibrate.
 
 ### 11.7 Override lifecycle
 
@@ -1060,7 +1101,9 @@ owns that).
 likely to surprise a user, so it is specified explicitly:
 
 1. **On registering an `always` override, the agent first reads and stores the current value**
-   of every field the snippet touches.
+   of every field the snippet touches. Which fields those are is not something the agent infers:
+   the request carries a `capture` snippet (§11.2), built together with the `code` and the
+   `restore` so the three cannot disagree.
 2. The agent re-applies the snippet each frame while the override is active.
 3. **`clear` restores the stored value** and removes the override. It does not merely stop
    enforcing — otherwise the last written value silently persists and `off` would appear to do
@@ -1070,6 +1113,18 @@ likely to surprise a user, so it is specified explicitly:
    forgotten CLI must not leave the game permanently modified.
 5. `live status` always reports the full set of active override keys and their current values,
    so "what is active right now" is answerable without inspecting the game.
+
+The captured originals are **Lua references, not JSON** (D13). They live in a table keyed by
+override key (`__krcheat_saved`), which is what lets a table-valued field be restored exactly and
+what keeps the restore path free of any encoding step that could fail.
+
+**The keeper (D11).** Item 4 has a consequence that is easy to miss until it bites: an override
+lives exactly as long as some process keeps saying so. `krcheat live gold infinity` therefore ends
+when the command ends, which contradicts what "infinity" suggests. `--keep` starts
+`core/live/keeper.py`, a detached process whose only job is to hold the heartbeat. It exits when
+the game exits (so it cannot leak past a session), when the agent reports no overrides left, or
+when it is asked to stop — in which case it clears the overrides first, rather than leaving them
+for the heartbeat to reap.
 
 Overrides are never persisted to the save file; tier 1 owns persistence (§12–§15).
 
@@ -1338,6 +1393,27 @@ S2's outcome is a branch point, not just a data point:
 | --- | --- |
 | **passes** | Transport B = one generated file in the save dir. M5 shrinks to a file writer. M7 demoted to backlog. F15 ships as §9.8. The Steam-reverts-the-bundle and signature hazards (§15.5) largely disappear. |
 | **fails** | Transport B keeps the ZIP repack and `repair`; F15 moves to tier 3 and inherits §14's risks; M7 is restored to a real milestone. |
+
+**S2 is now answerable by the tool itself (D17).** `krcheat install` writes the shadow module, and
+`krcheat install --check` reads the evidence file that only the *game* can produce, then records
+the verdict in `state.json`. Three states are distinguished, and the middle one is what keeps the
+check honest:
+
+| Evidence | Verdict |
+| --- | --- |
+| the evidence file exists | the game loaded our copy: **S2 passes** |
+| no evidence file, and the game has not written any of its own files since the install | *not answered yet* — the game has simply not been started |
+| no evidence file, but the game has written its own files since the install | the game ran and ignored our copy: **S2 fails** |
+
+Without that middle row, running `--check` too early would report a failed spike and send the user
+off to build a transport that was never given a chance.
+
+**S3–S5 are answered for transport A's mechanism, without the game.** The agent, a harness that
+links the game's real `Lua.framework`, and `tests/test_agent_integration.py` establish that a dylib
+loads into a process, captures a `lua_State *` by interposing `luaL_newstate` from *another image*,
+and gets a once-per-frame callback through an interposed `SDL_GL_SwapWindow`. What still needs the
+real game is only what only the game can answer: S1, S6, S7, and whether the injection survives an
+actual launch (S3 end to end).
 
 ### 16.2 Test layers
 

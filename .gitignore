@@ -26,8 +26,11 @@ venv/
 .ruff_cache/
 
 # --- natural-code artifacts (injected agent) ---
+# `make` builds these next to the sources for development; the CLI builds its own copy into
+# ~/.krcheat/agent/, named after a hash of the sources it came from. Neither is committed.
 *.o
 *.dylib
+krcheat/agent/kr_harness
 
 # --- local runtime state (never commit) ---
 .krcheat/

@@ -33,7 +33,14 @@ from krcheat.core import backup, config as config_mod, context as context_mod
 from krcheat.core import data as data_mod, doctor as doctor_mod, log as log_mod, paths
 from krcheat.core import profile as profile_mod, selftest as selftest_mod
 from krcheat.core import state as state_mod
-from krcheat.core.errors import EXIT_INTERNAL, EXIT_OK, KrcheatError, UsageError, milestone
+from krcheat.core.errors import (
+    EXIT_CHANNEL,
+    EXIT_INTERNAL,
+    EXIT_OK,
+    KrcheatError,
+    UsageError,
+    milestone,
+)
 from krcheat.core.result import Result
 
 PROGRAM = "krcheat"
@@ -101,6 +108,20 @@ def add_global_flags(parser, suppress=False):
     add("--no-oracle", dest="no_oracle", action="store_true",
         help="skip the S8 oracle check in the write path")
     add("-v", "--verbose", dest="verbose", action="store_true", help="debug logging to stderr")
+
+
+def add_transport_flag(parser):
+    """`--transport` selects among the live transports (§11.1).
+
+    Only the tier-2 commands get it: the transport is a strategy for reaching a running
+    game, and tier-1 commands do not have one.
+    """
+    parser.add_argument(
+        "--transport",
+        metavar="NAME",
+        choices=("dylib", "patched", "frida"),
+        help="which live transport to use (default: config live.preferred_transport)",
+    )
 
 
 def build_parser():
@@ -264,37 +285,70 @@ def build_parser():
     data_revert.add_argument("--all", dest="revert_all", action="store_true")
 
     # -- live (tier 2) -------------------------------------------------------
-    live = sub.add_parser("live", help="tier 2: the in-process channel (not built yet)")
+    live = sub.add_parser("live", help="tier 2: the in-process channel")
     add_global_flags(live, suppress=True)
+    add_transport_flag(live)
     live_sub = live.add_subparsers(dest="live_action", metavar="<action>")
     live_sub.required = True
-    live_sub.add_parser("status", help="channel health, transports, active overrides")
+    live_status = live_sub.add_parser("status", help="channel health, agent, active overrides")
+    live_status.add_argument("--agent-log", action="store_true", help="also print the agent's log")
+    live_status.add_argument("--stop-keeper", action="store_true",
+                             help="ask a background keeper to release its overrides")
+    live_status.add_argument("--prune", action="store_true",
+                             help="delete channel directories left by dead processes")
     probe = live_sub.add_parser("probe", help="dump the game's globals to resolve field paths")
     probe.add_argument("--out", metavar="FILE", help="write the dump here")
+    probe.add_argument("--depth", type=int, default=2, help="how deep to walk (1-4)")
     for name in ("gold", "lives"):
-        item = live_sub.add_parser(name, help="set, force, or release a value")
-        item.add_argument("value", help="N | infinity | off")
-    speed = live_sub.add_parser("speed", help="simulation multiplier")
+        item = live_sub.add_parser(name, help="write once, force every frame, or release")
+        item.add_argument("value", help="N (once) | infinity (every frame) | off (restore)")
+        item.add_argument("--keep", action="store_true",
+                          help="leave it on after this command exits, via a keeper process")
+    speed = live_sub.add_parser("speed", help="simulation multiplier (every frame)")
     speed.add_argument("value", help="multiplier | off")
+    speed.add_argument("--keep", action="store_true", help="leave it on after this command exits")
     god = live_sub.add_parser("god", help="disable life checking")
     god.add_argument("state", choices=("on", "off"))
+    god.add_argument("--keep", action="store_true", help="leave it on after this command exits")
+    off = live_sub.add_parser("off", help="release every override and restore the captured values")
+    off.add_argument("--all", action="store_true", help="same thing (explicit)")
     evaluate = live_sub.add_parser("eval", help="evaluate Lua once and print the result")
     evaluate.add_argument("code")
     live_sub.add_parser("watch", help="interactive prompt, until Ctrl-D")
 
+    # -- agent (the injected dylib) -----------------------------------------
+    agent = sub.add_parser("agent", help="build and inspect the injected agent (tier 2)")
+    add_global_flags(agent, suppress=True)
+    agent_sub = agent.add_subparsers(dest="agent_action", metavar="<action>")
+    agent_sub.required = True
+    agent_build = agent_sub.add_parser("build", help="compile the agent dylib")
+    agent_build.add_argument("--force", action="store_true", help="rebuild even if current")
+    agent_sub.add_parser("status", help="where the agent is, and whether it is current")
+
     # -- install / play / patch ---------------------------------------------
-    play = sub.add_parser("play", help="launch the game with the agent loaded (not built yet)")
+    play = sub.add_parser("play", help="launch the game with the agent loaded")
     add_global_flags(play, suppress=True)
-    play.add_argument("--no-cheats", dest="no_cheats", action="store_true")
+    add_transport_flag(play)
+    play.add_argument("--no-cheats", dest="no_cheats", action="store_true",
+                      help="launch the agent but register no overrides")
+    play.add_argument("--rebuild-agent", action="store_true", help="recompile the agent first")
+    play.add_argument("--wait", type=float, default=None,
+                      help="seconds to wait for the channel (default 45)")
     play.add_argument("steam_args", nargs=argparse.REMAINDER)
 
     for name, help_text in (
-        ("install", "install the tier-2 bootstrap (not built yet)"),
-        ("uninstall", "remove installed tier-2 artefacts"),
-        ("repair", "re-apply the tier-2 bootstrap after an integrity check"),
+        ("install", "install transport B's bootstrap into the save directory"),
+        ("uninstall", "remove every tier-2 artefact"),
+        ("repair", "re-apply transport B after an integrity check, and rebuild the agent"),
     ):
         item = sub.add_parser(name, help=help_text)
         add_global_flags(item, suppress=True)
+        if name == "install":
+            item.add_argument(
+                "--check",
+                action="store_true",
+                help="read the evidence the game wrote, and record the S2 verdict",
+            )
 
     patch = sub.add_parser("patch", help="tier 3: bytecode patching (backlog)")
     add_global_flags(patch, suppress=True)
@@ -850,69 +904,455 @@ def cmd_data(ctx, args):
 
 # -- live (tier 2) -----------------------------------------------------------
 
+#: The sentence every `live` command should not have to repeat. Stated once, in one place,
+#: because it is the single most surprising thing about this tool: a cheat does not persist
+#: by magic, it persists because a process keeps asking for it (§11.7.4).
+KEEP_NOTE = (
+    "this override is released when this command exits (the agent clears on a stale "
+    "heartbeat). Add --keep to leave it running."
+)
 
-def cmd_live(ctx, args):
-    action = args.live_action
-    if action == "status":
-        from krcheat.core.live import protocol, transport as transport_mod
 
-        result = Result(command="live.status")
-        try:
-            bundle = ctx.bundle()
-        except KrcheatError:
-            bundle = None
-        game = paths.find_game_process(bundle)
-        channels = protocol.list_channels()
-        doctor_state = ctx.state.get("last_doctor") or {}
-        payload = {
-            "game": game,
-            "game_running": game is not None,
-            "transports": transport_mod.describe_all(ctx),
-            "preferred": ctx.config.get_typed("live.preferred_transport"),
-            "channels": channels,
-            "overrides": [],
-            "doctor": doctor_state,
-            "ready": False,
-        }
-        result.set(**payload)
+def _live_transport(ctx, args, launch=False):
+    """Resolve the transport and make sure there is a live channel behind it."""
+    from krcheat.core.errors import ChannelUnavailable
+    from krcheat.core.live import transport as transport_mod
+
+    transport = transport_mod.select(ctx, getattr(args, "transport", None))
+    usable, reason = transport.available()
+    if not usable:
+        raise ChannelUnavailable(reason)
+    if reason:
+        ctx.log.info("agent.pending", reason=reason)
+    transport.start(launch=launch)
+    return transport
+
+
+def _keep_or_note(ctx, args, transport, keys, result):
+    """`--keep` spawns a keeper; otherwise say plainly when the override ends."""
+    from krcheat.core.live import keeper
+
+    if getattr(args, "keep", False):
+        pid = keeper.spawn(transport, keys, transport.heartbeat_timeout())
+        result.set(keeper_pid=pid, kept=True)
         result.note(
-            "the live channel is milestone M3 and is not built in this build; tier 1 "
-            "(profile/backup/data) is fully functional without it"
+            "kept: a background process (pid {0}) is holding the heartbeat, so the override "
+            "survives this command. Stop it with `krcheat live off` or `krcheat live status "
+            "--stop-keeper`.".format(pid)
+        )
+    else:
+        result.note(KEEP_NOTE.format())
+    return result
+
+
+def _live_value_command(ctx, args, key, value):
+    """`gold`/`lives`: a one-shot write, a per-frame override, or a restore."""
+    from krcheat.core.live import snippets
+
+    transport = _live_transport(ctx, args)
+    result = Result(command="live.{0}".format(key))
+
+    if value is None or str(value).lower() == "off":
+        # §11.7.3: `off` restores the captured value; it does not merely stop enforcing.
+        response = transport.clear(key)
+        result.set(key=key, mode="clear", agent=response.to_dict())
+        result.note(
+            "{0}: released, and the value captured when it was registered is restored".format(key)
         )
         return result
 
-    raise milestone(
-        "M3",
-        "live {0} needs the injected agent (milestone M3), which is not built in this build. "
-        "Tier-1 commands (profile show/get/set, backup, data) work now and need no injection.".format(action),
+    if str(value).lower() == "infinity":
+        code, capture, restore = snippets.override_snippets(key, None)
+        snippets.assert_safe(code)
+        response = transport.always(key, code, capture=capture, restore=restore)
+        result.set(key=key, mode="always", agent=response.to_dict())
+        _keep_or_note(ctx, args, transport, [key], result)
+        return result
+
+    try:
+        number = int(str(value))
+    except ValueError:
+        raise UsageError(
+            "{0} expects a number, 'infinity' or 'off'; got {1!r}".format(key, value)
+        )
+    if number < 0:
+        raise UsageError("{0} cannot be negative".format(key))
+    response = transport.once(snippets.for_override(key, number))
+    result.set(key=key, mode="once", value=number, agent=response.to_dict())
+    result.note(
+        "written once. The game keeps spending from it, so re-run with 'infinity' to hold it."
     )
+    return result
+
+
+def cmd_live(ctx, args):
+    from krcheat.core.live import agent as agent_mod
+    from krcheat.core.live import protocol, snippets
+    from krcheat.core.live import transport as transport_mod
+
+    action = args.live_action
+
+    if action == "status":
+        from krcheat.core.live import keeper
+
+        result = Result(command="live.status")
+        bundle = ctx.bundle_or_none()
+        game = paths.find_game_process(bundle)
+        channels = protocol.list_channels()
+        preferred = ctx.config.get_typed("live.preferred_transport")
+        transports = transport_mod.describe_all(ctx)
+        chosen = None
+        for item in transports:
+            if item.get("transport") == preferred:
+                chosen = item
+        payload = {
+            "game": game,
+            "game_running": game is not None,
+            "transports": transports,
+            "preferred": preferred,
+            "channels": channels,
+            "stale_channels": len(protocol.stale_channels()),
+            "overrides": [],
+            "live": False,
+            "keeper": {"running": False},
+            # Reported whether or not a channel exists: when the channel is down, "is the
+            # agent built?" is the first question, and a status command that answers it only
+            # on the happy path is not a diagnostic.
+            "agent_build": agent_mod.describe(getattr(ctx, "log", None)),
+        }
+        if args.prune:
+            removed = protocol.prune_channels()
+            payload["pruned"] = removed
+            payload["channels"] = protocol.list_channels()
+            payload["stale_channels"] = len(protocol.stale_channels())
+            result.note("pruned {0} abandoned channel(s)".format(len(removed)))
+
+        if channels:
+            newest = channels[0]
+            payload["channel"] = newest["path"]
+            payload["keeper"] = keeper.describe(newest["path"])
+            if args.stop_keeper and keeper.describe(newest["path"]).get("running"):
+                stopped = keeper.stop(channel_path=newest["path"])
+                result.note("asked the keeper to stop: {0}".format("sent" if stopped else "failed"))
+
+        try:
+            transport = _live_transport(ctx, args)
+        except KrcheatError as exc:
+            payload["live"] = False
+            payload["live_error"] = str(exc)
+            result.set(**payload)
+            if chosen and chosen.get("agent", {}).get("built") is None:
+                result.note(
+                    "the agent is not built yet. It is compiled once, on demand, by "
+                    "`krcheat agent build`, or implicitly by `krcheat play`."
+                )
+            return result
+
+        payload["live"] = True
+        payload["transport"] = transport.describe()
+        try:
+            payload["overrides"] = transport.status().decoded() or {}
+        except KrcheatError as exc:
+            payload["live"] = False
+            payload["live_error"] = str(exc)
+        if args.agent_log:
+            payload["agent_log"] = transport.agent_log(40)
+        result.set(**payload)
+        return result
+
+    if action == "probe":
+        transport = _live_transport(ctx, args)
+        response = transport.once(snippets.probe(depth=getattr(args, "depth", 2)))
+        payload = response.decoded()
+        result = Result(command="live.probe")
+        result.set(ok=response.ok, error=response.error, source=response.result)
+        if isinstance(payload, dict) and isinstance(payload.get("paths"), dict):
+            paths_found = payload["paths"]
+            result.set(paths=paths_found)
+            result.note(
+                "resolved {0} reachable path(s); the owner chain to use is the one that "
+                "contains player_gold".format(len(paths_found))
+            )
+            if args.out:
+                _write_text(args.out, json.dumps(paths_found, indent=2, sort_keys=True))
+                result.note("written to {0}".format(args.out))
+        elif not response.ok:
+            result.ok = False
+            result.exit_code = EXIT_CHANNEL
+        return result
+
+    if action == "eval":
+        transport = _live_transport(ctx, args)
+        response = transport.once(snippets.eval_snippet(args.code))
+        result = Result(command="live.eval")
+        result.set(ok=response.ok, error=response.error, result=response.decoded())
+        if not response.ok:
+            result.ok = False
+            result.exit_code = EXIT_CHANNEL
+        return result
+
+    if action == "off":
+        transport = _live_transport(ctx, args)
+        from krcheat.core.live import keeper
+
+        channel = transport.channel()
+        if channel is not None:
+            keeper.stop(channel_path=channel.path)
+        response = transport.clear_all()
+        result = Result(command="live.off")
+        result.set(agent=response.to_dict())
+        result.note("every override released, and every captured value restored")
+        return result
+
+    if action == "watch":
+        return _live_watch(ctx, args)
+
+    if action in ("gold", "lives"):
+        return _live_value_command(ctx, args, action, args.value)
+
+    if action == "speed":
+        transport = _live_transport(ctx, args)
+        result = Result(command="live.speed")
+        if str(args.value).lower() == "off":
+            response = transport.clear("speed")
+            result.set(key="speed", mode="clear", agent=response.to_dict())
+            result.note("speed: released, and the captured multiplier restored")
+            return result
+        try:
+            multiplier = float(args.value)
+        except ValueError:
+            raise UsageError("speed expects a number or 'off'; got {0!r}".format(args.value))
+        if multiplier <= 0:
+            raise UsageError("a speed multiplier must be greater than zero")
+        code, capture, restore = snippets.override_snippets("speed", multiplier)
+        snippets.assert_safe(code)
+        response = transport.always("speed", code, capture=capture, restore=restore)
+        result.set(key="speed", mode="always", value=multiplier, agent=response.to_dict())
+        _keep_or_note(ctx, args, transport, ["speed"], result)
+        return result
+
+    if action == "god":
+        transport = _live_transport(ctx, args)
+        result = Result(command="live.god")
+        if args.state == "off":
+            response = transport.clear("god")
+            result.set(key="god", mode="clear", agent=response.to_dict())
+            result.note("god: released, and the captured game_outcome restored")
+            return result
+        code, capture, restore = snippets.override_snippets("god")
+        snippets.assert_safe(code)
+        response = transport.always("god", code, capture=capture, restore=restore)
+        result.set(key="god", mode="always", agent=response.to_dict())
+        _keep_or_note(ctx, args, transport, ["god"], result)
+        return result
+
+    raise UsageError("unknown live action {0!r}".format(action))
+
+
+def _live_watch(ctx, args):
+    """An interactive prompt. Reads stdin, evaluates one snippet at a time (§10.3)."""
+    from krcheat.core.live import snippets
+
+    transport = _live_transport(ctx, args)
+    result = Result(command="live.watch")
+    evaluated = 0
+    stream = sys.stdin
+    if stream is None or not stream.isatty():
+        raise UsageError(
+            "live watch needs a terminal on stdin. In a script or a pipe, use "
+            "`krcheat live eval \"<lua>\"` for each snippet instead."
+        )
+    sys.stdout.write("krcheat live watch — Lua, one snippet per line; Ctrl-D to leave\n")
+    sys.stdout.flush()
+    while True:
+        try:
+            line = stream.readline()
+        except KeyboardInterrupt:  # pragma: no cover - interactive
+            break
+        if not line:
+            break
+        line = line.rstrip("\n")
+        if not line.strip():
+            continue
+        if line.strip() in ("quit", "exit", "\\q"):
+            break
+        try:
+            response = transport.once(snippets.eval_snippet(line))
+        except KrcheatError as exc:
+            sys.stdout.write("error: {0}\n".format(exc))
+            sys.stdout.flush()
+            break
+        evaluated += 1
+        sys.stdout.write("{0}\n".format(json.dumps(response.to_dict(), ensure_ascii=False)))
+        sys.stdout.flush()
+    result.set(evaluated=evaluated)
+    return result
+
+
+def cmd_agent(ctx, args):
+    from krcheat.core.live import agent as agent_mod
+
+    if args.agent_action == "build":
+        result = Result(command="agent.build")
+        built = agent_mod.build(force=args.force, logger=ctx.log)
+        result.set(path=built, fingerprint=agent_mod.fingerprint()[:16])
+        result.note("inject it with `krcheat play`, which sets {0}".format(
+            "DYLD_INSERT_LIBRARIES"))
+        return result
+
+    result = Result(command="agent.status")
+    result.set(**agent_mod.describe(ctx.log))
+    return result
 
 
 def cmd_play(ctx, args):
     from krcheat.core.live.transport_dylib import DylibTransport
 
     transport = DylibTransport(ctx=ctx)
-    raise milestone("M3", transport.reason)
-
-
-def cmd_install(ctx, args):
-    from krcheat.core.live.transport_patched import PatchedLoveTransport
-
-    raise milestone("M5", PatchedLoveTransport(ctx=ctx).reason)
-
-
-def cmd_uninstall(ctx, args):
-    # Removing F15 shadow modules is tier 1 and *is* implemented, so point at it.
-    result = Result(command="uninstall")
-    removed = data_mod.revert(ctx, result, level=None)
-    result.note("tier-2 artefacts are not present in this build; nothing else to remove")
+    result = Result(command="play")
+    if args.rebuild_agent:
+        transport.agent_path(force_build=True)
+    pid = transport.launch(wait=args.wait)
+    result.set(pid=pid, channel=transport.channel().path if transport.channel() else None)
+    if args.no_cheats:
+        result.note("the agent is loaded but no overrides are registered (--no-cheats)")
+    else:
+        result.note(
+            "the game is running with the agent loaded. Use `krcheat live status` to see the "
+            "channel, and `krcheat live gold infinity` to add an override."
+        )
+    if args.steam_args:
+        result.warn(
+            "extra arguments were given but are not passed to the game: the launcher is the "
+            "bundle's own executable, and it does not take Steam's arguments"
+        )
     return result
 
 
-def cmd_repair(ctx, args):
+def cmd_install(ctx, args):
+    """Transport B: one generated file in the save directory, and then ask the game (S2)."""
     from krcheat.core.live.transport_patched import PatchedLoveTransport
 
-    raise milestone("M5", PatchedLoveTransport(ctx=ctx).reason)
+    transport = PatchedLoveTransport(ctx=ctx)
+    result = Result(command="install")
+
+    if args.check:
+        evidence = transport.check()
+        result.set(evidence=evidence, verdict=transport.verdict())
+        if evidence.get("loaded"):
+            result.note(
+                "the game loaded the bootstrap from the save directory, so transport B works "
+                "on this install. The hook it used was {0}.".format(evidence.get("hook"))
+            )
+        elif evidence.get("conclusive"):
+            result.note("the bootstrap did not take effect: {0}".format(evidence.get("reason")))
+            result.warn(
+                "spike S2 has failed for this build, so transport B would have to be the "
+                "ZIP-repack variant. Keep using the dylib transport, which needs no game files "
+                "changed at all."
+            )
+        else:
+            # Not a failure yet, and saying otherwise would be wrong: the game has simply not
+            # been started since the install.
+            result.note(evidence.get("reason"))
+            result.note(evidence.get("hint"))
+        return result
+
+    written = transport.install()
+    result.set(**written)
+    result.note(
+        "written: {0} (shadowing {1} inside game.love)".format(
+            written["shadow"], transport_mod_shadow_name()
+        )
+    )
+    result.note(
+        "now launch the game once — from Steam is fine — and then run `krcheat install "
+        "--check`. Until the game confirms it loaded our file, transport B is unverified and "
+        "`live status` will say so."
+    )
+    return result
+
+
+def transport_mod_shadow_name():
+    from krcheat.core.live.transport_patched import SHADOW_MODULE
+
+    return SHADOW_MODULE
+
+
+def cmd_uninstall(ctx, args):
+    """Remove every tier-2 artefact. Tier 2 touches the game installation only via this."""
+    from krcheat.core.live.transport_patched import PatchedLoveTransport
+
+    result = Result(command="uninstall")
+    removed = []
+    try:
+        removed = PatchedLoveTransport(ctx=ctx).uninstall()
+    except (KrcheatError, OSError) as exc:
+        result.warn("transport B artefacts were not removed: {0}".format(exc))
+    result.set(removed_transport_b=removed)
+
+    # F15 shadow modules are tier 1's, and they live in the same save directory.
+    data_mod.revert(ctx, result, level=None)
+
+    from krcheat.core.live import agent as agent_mod
+
+    agents = []
+    for path in _agent_build_files():
+        try:
+            os.remove(path)
+            agents.append(os.path.basename(path))
+        except OSError:
+            continue
+    result.set(removed_agents=agents)
+    result.note(
+        "every built agent dylib was removed; the next live command rebuilds it. Transport A "
+        "never modifies the game installation, so there is nothing else to undo."
+    )
+    return result
+
+
+def _agent_build_files():
+    from krcheat.core.live import agent as agent_mod
+
+    directory = agent_mod.build_dir()
+    try:
+        return [
+            os.path.join(directory, name)
+            for name in os.listdir(directory)
+            if name.startswith("kr_agent-") and name.endswith(".dylib")
+        ]
+    except OSError:
+        return []
+
+
+def cmd_repair(ctx, args):
+    """Re-apply the transport that is in use.
+
+    Transport A modifies nothing, so its only failure mode is a missing dylib, and its repair
+    is a rebuild. Transport B is a file in a directory Steam can revert, so its repair is a
+    rewrite — and it is only meaningful if it was installed in the first place.
+    """
+    from krcheat.core.live import agent as agent_mod
+    from krcheat.core.live.transport_patched import PatchedLoveTransport
+
+    result = Result(command="repair")
+    transport_b = PatchedLoveTransport(ctx=ctx)
+    if transport_b.installed():
+        written = transport_b.repair()
+        result.set(transport_b=written)
+        result.note("transport B bootstrap rewritten: {0}".format((written or {}).get("shadow")))
+        verdict = transport_b.verdict()
+        if not verdict:
+            result.note("it is still unverified: run the game and `krcheat install --check`")
+    else:
+        result.note(
+            "transport B is not installed (and does not need to be: it modifies game files, "
+            "while the dylib transport modifies nothing)."
+        )
+    built = agent_mod.build(force=True, logger=ctx.log)
+    result.set(agent=built, rebuilt=True)
+    result.note("the agent was rebuilt from source at {0}".format(built))
+    return result
 
 
 def cmd_patch(ctx, args):
@@ -956,6 +1396,19 @@ def _persist(ctx):
         ctx.log.warn("state.save_failed", error=str(exc))
 
 
+def _write_text(path, text):
+    """Write a report the user asked for. Not a save file: no snapshot, no gates."""
+    directory = os.path.dirname(os.path.abspath(path))
+    if directory and not os.path.isdir(directory):
+        raise UsageError("cannot write {0}: {1} is not a directory".format(path, directory))
+    try:
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(text if text.endswith("\n") else text + "\n")
+    except OSError as exc:
+        raise UsageError("cannot write {0}: {1}".format(path, exc))
+    return path
+
+
 HANDLERS: Dict[str, Callable[[Any, Any], Result]] = {
     "doctor": cmd_doctor,
     "profile": cmd_profile,
@@ -964,6 +1417,7 @@ HANDLERS: Dict[str, Callable[[Any, Any], Result]] = {
     "config": cmd_config,
     "data": cmd_data,
     "live": cmd_live,
+    "agent": cmd_agent,
     "play": cmd_play,
     "install": cmd_install,
     "uninstall": cmd_uninstall,
@@ -1226,7 +1680,14 @@ def _render_data_revert(result, stream):
 def _render_live_status(result, stream):
     payload = result.payload
     game = payload.get("game")
-    stream.write("game: {0}\n".format("running (pid {0})".format(game["pid"]) if game else "not running"))
+    stream.write(
+        "game: {0}\n".format(
+            "running (pid {0})".format(game["pid"]) if game else "not running"
+        )
+    )
+    stream.write("channel: {0}\n".format("live" if payload.get("live") else "no"))
+    if payload.get("live") and payload.get("channel"):
+        stream.write("  path: {0}\n".format(payload["channel"]))
     stream.write("preferred transport: {0}\n".format(payload.get("preferred")))
     for item in payload.get("transports", []):
         stream.write(
@@ -1235,12 +1696,116 @@ def _render_live_status(result, stream):
                 "available" if item.get("available") else "unavailable: {0}".format(item.get("reason")),
             )
         )
+    agent = (payload.get("transport") or {}).get("agent") or payload.get("agent_build")
+    if agent:
+        stream.write("agent: {0}\n".format(agent.get("built") or "not built"))
+        if agent.get("reason"):
+            stream.write("  {0}\n".format(agent["reason"]))
+    keeper = payload.get("keeper") or {}
+    if keeper.get("running"):
+        stream.write("keeper: holding the heartbeat (pid {0})\n".format(keeper.get("pid")))
+    overrides = payload.get("overrides") or {}
+    entries = overrides.get("overrides") if isinstance(overrides, dict) else None
+    if entries:
+        stream.write("overrides:\n")
+        for entry in entries:
+            stream.write(
+                "  {0:<6} applied={1} frames_since={2}{3}\n".format(
+                    entry.get("key"),
+                    entry.get("applied"),
+                    entry.get("frames_since_applied"),
+                    "  captured={0}".format(entry.get("saved")) if entry.get("saved") else "",
+                )
+            )
+    else:
+        stream.write("overrides: none\n")
+    if payload.get("live_error"):
+        stream.write("why not live: {0}\n".format(payload["live_error"]))
     channels = payload.get("channels", [])
-    stream.write("channels: {0}\n".format(
-        ", ".join(str(item.get("pid")) for item in channels) if channels else "none"
-    ))
+    stream.write(
+        "channels: {0}\n".format(
+            " ".join(str(item.get("pid")) for item in channels) if channels else "none"
+        )
+    )
+    stale = payload.get("stale_channels") or 0
+    if stale:
+        stream.write(
+            "  {0} abandoned channel(s) from dead processes; "
+            "`krcheat live status --prune` removes them\n".format(stale)
+        )
+    for line in payload.get("agent_log") or []:
+        stream.write("  agent | {0}\n".format(line))
     for note in result.notes:
         stream.write("{0}\n".format(note))
+
+
+def _render_live_probe(result, stream):
+    payload = result.payload
+    paths_found = payload.get("paths") or {}
+    if payload.get("error"):
+        stream.write("error: {0}\n".format(payload["error"]))
+    if paths_found:
+        for key in sorted(paths_found)[:200]:
+            stream.write("{0} = {1}\n".format(key, paths_found[key]))
+        if len(paths_found) > 200:
+            stream.write("... and {0} more; use --out FILE for the whole dump\n".format(
+                len(paths_found) - 200))
+    elif not payload.get("error"):
+        stream.write("no paths reported\n")
+    for note in result.notes:
+        stream.write("{0}\n".format(note))
+
+
+def _render_live_result(result, stream):
+    """`live gold`, `lives`, `speed`, `god`, `eval`, `off` — the shape is the same."""
+    payload = result.payload
+    if payload.get("key"):
+        stream.write("{0}: {1}\n".format(payload["key"], payload.get("mode")))
+    agent = payload.get("agent") or {}
+    if agent.get("result") is not None:
+        stream.write("{0}\n".format(_short(agent["result"])))
+    if agent.get("error"):
+        stream.write("agent error: {0}\n".format(agent["error"]))
+    if payload.get("result") is not None:
+        stream.write("{0}\n".format(_short(payload["result"])))
+    if payload.get("error"):
+        stream.write("error: {0}\n".format(payload["error"]))
+    for line in result.notes:
+        stream.write("{0}\n".format(line))
+
+
+def _render_agent_status(result, stream):
+    payload = result.payload
+    if payload.get("path"):
+        stream.write("built: {0}\n".format(payload["path"]))
+        stream.write("fingerprint: {0}\n".format(payload.get("fingerprint")))
+    else:
+        stream.write("source: {0}\n".format(payload.get("source_dir")))
+        stream.write("fingerprint: {0}\n".format(payload.get("fingerprint")))
+        stream.write("built: {0}\n".format(payload.get("built") or "not yet"))
+        stream.write("build dir: {0}\n".format(payload.get("build_dir")))
+        stream.write("architectures: {0}\n".format(payload.get("archs")))
+        tools = payload.get("toolchain") or {}
+        stream.write("clang: {0}\n".format(tools.get("clang") or "not found"))
+        stream.write("codesign: {0}\n".format(tools.get("codesign") or "not found"))
+        stream.write("usable: {0}\n".format("yes" if payload.get("usable") else "no"))
+        if payload.get("reason"):
+            stream.write("  {0}\n".format(payload["reason"]))
+    for line in result.notes:
+        stream.write("{0}\n".format(line))
+
+
+def _render_play(result, stream):
+    payload = result.payload
+    stream.write("game pid: {0}\n".format(payload.get("pid")))
+    if payload.get("channel"):
+        stream.write("channel: {0}\n".format(payload["channel"]))
+    for line in result.notes:
+        stream.write("{0}\n".format(line))
+
+
+def _render_live_watch(result, stream):
+    stream.write("{0} snippet(s) evaluated\n".format(result.payload.get("evaluated", 0)))
 
 
 RENDERERS: Dict[str, Callable[[Result, Any], None]] = {
@@ -1264,6 +1829,17 @@ RENDERERS: Dict[str, Callable[[Result, Any], None]] = {
     "data.set": _render_data_set,
     "data.revert": _render_data_revert,
     "live.status": _render_live_status,
+    "live.probe": _render_live_probe,
+    "live.eval": _render_live_result,
+    "live.off": _render_live_result,
+    "live.gold": _render_live_result,
+    "live.lives": _render_live_result,
+    "live.speed": _render_live_result,
+    "live.god": _render_live_result,
+    "live.watch": _render_live_watch,
+    "agent.build": _render_agent_status,
+    "agent.status": _render_agent_status,
+    "play": _render_play,
 }
 
 

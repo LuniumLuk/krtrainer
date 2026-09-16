@@ -7,6 +7,7 @@ enhances the tool, it is not required by it.
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -25,8 +26,36 @@ def oracle_available():
 class TestSnippets(unittest.TestCase):
     def test_every_template_encodes_its_result(self):
         for name, code in snippets.all_templates().items():
+            if name.startswith("restore_"):
+                continue  # asserted below to be the exception, on purpose
             with self.subTest(name=name):
                 self.assertIn("json.encode", code)
+
+    def test_restore_templates_do_not_depend_on_the_games_json_module(self):
+        # A deliberate asymmetry (§11.7.3). Capture *reports* what it stored as JSON, but the
+        # stored originals are Lua references, and restore uses only those. Restoring is what
+        # runs when a user turns a cheat off or the heartbeat expires, so it must not be able
+        # to fail because `lib/json` was unavailable or a value was not encodable.
+        for key in ("gold", "lives", "speed", "god"):
+            with self.subTest(key=key):
+                restore = snippets.restore_for(key)
+                self.assertNotIn("json", restore)
+                self.assertIn("__krcheat_saved", restore)
+                self.assertIn("__krcheat_key", restore)
+                self.assertIn("json.encode", snippets.capture_for(key))
+
+    def test_override_snippets_are_built_as_a_matching_triple(self):
+        for key in ("gold", "lives", "speed", "god"):
+            with self.subTest(key=key):
+                code, capture, restore = snippets.override_snippets(key)
+                self.assertEqual(code, snippets.for_override(key))
+                self.assertEqual(capture, snippets.capture_for(key))
+                self.assertEqual(restore, snippets.restore_for(key))
+                # Both halves must agree about which fields are involved, or `off` puts back
+                # the wrong value and looks like it worked.
+                for field in snippets.FIELDS_FOR_OVERRIDE.get(key, ()):
+                    self.assertIn(field, capture)
+                    self.assertIn(field, restore)
 
     def test_no_per_frame_template_contains_control_flow(self):
         for name, code in snippets.per_frame_templates().items():
@@ -139,6 +168,56 @@ class TestProtocol(unittest.TestCase):
         channel.touch_heartbeat()
         self.assertIsNotNone(channel.heartbeat_age())
         self.assertLess(channel.heartbeat_age(), 5)
+
+    def test_a_write_removes_the_previous_response(self):
+        """§11.3: a response is consumed exactly once.
+
+        Without this, a caller that asks twice in a row can read the *first* answer as the
+        answer to its second question — which is not hypothetical: it is what made every
+        `live` command report the result of the command before it.
+        """
+        channel = protocol.Channel(4247)
+        channel.write_request(protocol.Request.once("return 1", request_id=1))
+        with open(channel.out_path, "w", encoding="utf-8") as handle:
+            json.dump({"id": 1, "ok": True, "result": '{"first": true}', "_test": True}, handle)
+        self.assertIsNotNone(channel.read_response(request_id=1))
+        channel.write_request(protocol.Request.once("return 2", request_id=2))
+        self.assertIsNone(
+            channel.read_response(request_id=2), "a stale response survived a new request"
+        )
+
+    def test_channels_only_list_processes_that_still_exist(self):
+        live = os.getpid()
+        dead = _a_pid_that_is_gone()
+        protocol.Channel(live)
+        protocol.Channel(dead)
+        pids = [item["pid"] for item in protocol.list_channels()]
+        self.assertIn(live, pids)
+        self.assertNotIn(dead, pids)
+        self.assertIn(dead, [item["pid"] for item in protocol.stale_channels()])
+
+    def test_pruning_is_age_gated_and_removes_only_dead_channels(self):
+        live = os.getpid()
+        dead = _a_pid_that_is_gone()
+        fresh = _a_pid_that_is_gone()
+        protocol.Channel(live)
+        protocol.Channel(dead)
+        protocol.Channel(fresh)
+        # A channel that appeared seconds ago usually means a process still starting up, so a
+        # young one must survive even though its pid is gone.
+        self.assertNotIn(dead, protocol.prune_channels(min_age=3600))
+        removed = protocol.prune_channels(min_age=0.0)
+        self.assertIn(dead, removed)
+        self.assertIn(fresh, removed)
+        self.assertNotIn(live, removed)
+        self.assertTrue(os.path.isdir(protocol.channel_dir(live)))
+
+
+def _a_pid_that_is_gone():
+    """A pid that no longer exists. `os.fork` is not used: this must work anywhere."""
+    probe = subprocess.Popen([sys.executable, "-c", "pass"])
+    probe.wait()
+    return probe.pid
 
 
 class TestOracle(unittest.TestCase):

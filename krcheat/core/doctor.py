@@ -298,20 +298,39 @@ def _check_processes(ctx):
 
 
 def _check_tools(ctx):
-    clang = shutil.which("clang")
-    codesign = shutil.which("codesign")
-    agent = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "agent", "kr_agent.dylib")
-    built = os.path.exists(agent)
+    """The compiler the agent needs once, and whether it has been built.
+
+    Reported as three facts rather than one verdict, because they fail differently: no clang
+    means transport A is unavailable on this machine, while "not built yet" means the next
+    live command will spend a few seconds compiling and then work. `live status` carries the
+    same report, so this stays a summary.
+    """
+    from krcheat.core.live import agent as agent_mod
+
+    info = agent_mod.describe(getattr(ctx, "log", None))
+    usable, reason = info["usable"], info["reason"]
+    # Transport B is compiled by nothing, so it stays available with no toolchain at all.
+    from krcheat.core.live.transport_patched import PatchedLoveTransport
+
+    transport_b = PatchedLoveTransport(ctx=None).installed() or None
+    detail = "clang={0}, codesign={1}, agent={2}".format(
+        info["toolchain"]["clang"] or "missing",
+        info["toolchain"]["codesign"] or "missing",
+        os.path.basename(info["built"]) if info["built"] else "not built yet",
+    )
+    if transport_b is not None:
+        detail += ", transport B installed=yes"
     return [
         Gate(
             "agent toolchain",
-            PASS if (clang and codesign) else WARN,
-            "clang={0}, codesign={1}, agent built={2}".format(
-                clang or "missing", codesign or "missing", "yes" if built else "no"
-            ),
-            clang=clang,
-            codesign=codesign,
-            agent_built=built,
+            PASS if usable else WARN,
+            detail,
+            usable=usable,
+            reason=reason,
+            source_dir=info["source_dir"],
+            built=info["built"],
+            fingerprint=info["fingerprint"],
+            toolchain=info["toolchain"],
         )
     ]
 

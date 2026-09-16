@@ -2,9 +2,22 @@
 
 Command-line trainer and save editor for **Kingdom Rush** on **macOS**.
 
-The CLI is called `krcheat`. Tier 1 — the save editor — is implemented and needs no
-injection, no root and no compiler. Tiers 2 and 3 are specified but not built yet, and they
-say so rather than pretending.
+The CLI is called `krcheat`. Tier 1 — the save editor — is implemented and needs no injection, no
+root and no compiler. Tier 2 — the live channel — is implemented too, and needs a compiler **once**
+(about two seconds, on the first live command) and a game started by `krcheat play`, because the
+agent is a dylib and a dylib has to be in the environment at launch. Tier 3 is a backlog item, and
+says so rather than pretending.
+
+Every command that is not implemented refuses with **exit 3** and a sentence naming what is
+missing — never silently, never with a traceback.
+
+```sh
+krcheat doctor                     # can this tool work here?
+krcheat --slot 1 profile set gems 9999
+krcheat play                       # the game, with the live channel attached
+krcheat live gold infinity         # 99999, re-applied every frame
+krcheat live gold off              # released, and the captured value restored
+```
 
 ---
 
@@ -35,15 +48,24 @@ Two properties of the macOS build make a *better* trainer possible:
 
 ## Running it
 
-The language floor is **Python 3.9** and there are **no dependencies**: the standard library
-only, for every tier and both front-ends. Verified on **3.9.6**, **3.13.14** and **3.14.3** —
-the interpreters present on the reference machine.
+The language floor is **Python 3.9** and there are **no Python dependencies**: the standard
+library only, for every tier and both front-ends. Verified on **3.9.6**, **3.13.14** and
+**3.14.3** — the interpreters present on the reference machine.
+
+Tier 2 additionally compiles a small C dylib with the system `clang`, on first use, into
+`~/.krcheat/agent/`. That is the only external tool either tier needs, and it is needed once:
+the built dylib is named after a hash of its sources, so a new build is picked up automatically and
+a stale one is impossible.
 
 ```sh
 cd /path/to/krtrainer
 python3 -m krcheat doctor              # can this tool do its job here?
 python3 -m krcheat --slot 1 profile show
 python3 -m krcheat --slot 1 profile set gems 9999
+
+python3 -m krcheat play                # tier 2: the game, with the live channel attached
+python3 -m krcheat live status
+python3 -m krcheat live gold infinity --keep
 ```
 
 Or install the console script:
@@ -118,7 +140,7 @@ grow without bound.
 | 0 | success |
 | 1 | usage error (including "no slot given, cannot prompt") |
 | 2 | game/app/save/slot not found |
-| 3 | unavailable — the live channel, or a documented-but-unbuilt milestone |
+| 3 | channel unavailable (no game running, or the game was not started by `krcheat play`) — and a documented-but-unbuilt milestone |
 | 4 | validation failure (schema, mandatory keys, out-of-range value) |
 | 5 | backup or restore failure |
 | 6 | internal error (always accompanied by a traceback in the log) |
@@ -233,10 +255,10 @@ krtrainer/
 │   │   ├── doctor.py           # environment checks
 │   │   ├── selftest.py         # the regression guard
 │   │   ├── log.py, config.py, state.py, paths.py, context.py, errors.py, result.py
-│   │   ├── live/               # tier 2: protocol + snippets real, agent absent (M3)
+│   │   ├── live/               # tier 2: protocol, snippets, transports, keeper
 │   │   └── patch/              # tier 3: backlog (M8)
-│   └── agent/                  # the injected dylib — not written yet (M3)
-└── tests/                      # 193 tests, stdlib unittest
+│   └── agent/                  # the injected dylib, its harness and its Makefile
+└── tests/                      # 244 tests, stdlib unittest
 ```
 
 The CLI is the foundation: all behaviour lives in `core/`, and both `cli.py` and `gui/` are thin
@@ -248,17 +270,19 @@ only one implementation.
 ## Tests
 
 ```sh
-python3 -m unittest discover -s tests -v     # 193 tests
-python3 -m krcheat --self-test               # the same checks, in the shipped tool
+python3 -m unittest discover -s tests -t tests -v     # 244 tests
+python3 -m krcheat --self-test                        # the same checks, in the shipped tool
 ```
 
 Layers, per the spec: **unit** (codec byte-identity over synthetic fixtures and over generated
 text, targeted edits, backup hash verification, config preservation, state invalidation, operation
 ranges, the no-deletion guard), **oracle** (every fixture loaded in the game's own LuaJIT —
 skipped, not failed, when the game is not installed), **golden** (a checked-in *synthetic* save,
-never a real one), **CLI end-to-end** (dispatch, exit codes, dry-run, snapshots), and
-**regression** (`test_regressions.py`: one test per bug found in the review of 2026-09-16, listed
-in [`IMPLEMENTATION.md`](IMPLEMENTATION.md#7-review-of-2026-09-16--what-it-found)).
+never a real one), **CLI end-to-end** (dispatch, exit codes, dry-run, snapshots), **live
+integration** (`test_agent_integration.py`: compiles the agent with the production builder, injects
+it into a separate process, and drives the real channel against the game's own LuaJIT), and
+**regression** (`test_regressions.py`, `test_live_bootstrap.py`: one test per bug found in a review
+or while building — both lists are in [`IMPLEMENTATION.md`](IMPLEMENTATION.md)).
 
 ---
 
@@ -268,19 +292,24 @@ in [`IMPLEMENTATION.md`](IMPLEMENTATION.md#7-review-of-2026-09-16--what-it-found
 | --- | --- |
 | Reverse engineering + specification | done |
 | Specification review (D1–D9, [§2.1](KRCHEAT_FOUNDATION.md#21-design-decisions-review-of-2026-09-16)) | done |
-| M0 — spikes (S2, S6, S8) | **S8 implemented**; S1–S7 still to run |
+| Design review after M3–M5 (D11–D17, [§2.2](KRCHEAT_FOUNDATION.md#22-design-decisions-review-of-2026-09-17-after-building-m3m5)) | done |
+| M0 — spikes | **S8 implemented**, and S3–S5 answered for the agent's mechanism by a harness; S1, S2, S6, S7 need the game running |
 | M1 — Tier 1 core + write path | **done** |
 | M2 — Tier 1 complete (F3–F8, `list`) + F15 generation | **done** |
-| M3–M4 — live channel (agent, gold/lives/speed/god) | not started — commands exit 3 naming the milestone |
-| M5 — Transport B (bootstrap module) | not started, conditional on S2 |
-| M6 — Packaging and docs | partial (`pyproject.toml`, this README) |
+| M3 — the injected agent (channel, `probe`, `eval`, `status`) | **done** |
+| M4 — live commands and the override lifecycle (§11.7) | **done**, including `--keep` and the keeper (D11) |
+| M5 — Transport B (bootstrap module) | **mechanism done**; `install --check` lets the game answer S2, and `start()` refuses rather than half-working |
+| M6 — Packaging and docs | partial (`pyproject.toml`, this README, [`CHEATSHEET.md`](CHEATSHEET.md)) |
 | M7 — tkinter GUI (F16) | **written and opt-in** (`ui.enabled`), deferred by D10; unusable on this machine's Tk 8.5 |
 | M8 — Bytecode patcher | backlog, as designed |
 
-Two questions are still open and are listed as spikes rather than assumptions: **S2**
-(save-directory `require` precedence in LÖVE 0.10.1 — expected to pass, and it decides the shape
-of M5 and whether M8 is ever needed) and **S6** (the runtime owner chain of `player_gold` /
-`lives`). Both are in [open questions](KRCHEAT_FOUNDATION.md#19-open-questions).
+Two questions still need the game running, and are listed as spikes rather than assumptions:
+**S2** (save-directory `require` precedence in LÖVE 0.10.1 — it decides the shape of M5 and
+whether M8 is ever needed) and **S6** (the runtime owner chain of `player_gold` / `lives`, plus the
+sentinels `god` and `speed` use). Nothing *mechanical* is unverified: the agent, the channel, the
+override lifecycle and transport B's install path are all covered by tests that run without the
+game. Both open questions are in
+[open questions](KRCHEAT_FOUNDATION.md#19-open-questions).
 
 `krcheat data set level …` generates its shadow module today, but its effect is **unverified
-until S2 passes** — the command says so on every run.
+until S2 passes** — the command says so on every run, and so does `krcheat install --check`.

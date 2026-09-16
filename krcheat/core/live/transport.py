@@ -20,6 +20,7 @@ failing mysteriously. `live status` is the command that says so plainly.
 
 from __future__ import annotations
 
+import time
 from typing import Dict, List, Optional, Tuple
 
 from krcheat.core.errors import ChannelUnavailable, UsageError, milestone
@@ -83,11 +84,25 @@ class LiveTransport(object):
             self._channel = Channel(pid)
         return self._channel
 
-    def send(self, channel, request, timeout=DEFAULT_TIMEOUT):
-        """Write a request and wait for its response, with the heartbeat kept alive."""
+    def send(self, channel, request, timeout=DEFAULT_TIMEOUT, touch=True):
+        """Write a request and wait for its response.
+
+        `touch` renews the heartbeat while waiting, which is the right default: a CLI that is
+        still working is still asking for the override to exist. Passing False is how a caller
+        says "I am done asking" — it is what lets the auto-clear be observed rather than
+        merely intended (§11.7.4).
+        """
         payload = channel.write_request(request)
         self.log("channel.request", **{k: v for k, v in payload.items() if k != "code"})
-        response = channel.wait_response(request.id, timeout=timeout)
+        if touch:
+            response = channel.wait_response(request.id, timeout=timeout)
+        else:
+            deadline = time.time() + float(timeout)
+            response = None
+            while response is None and time.time() <= deadline:
+                response = channel.read_response(request.id)
+                if response is None:
+                    time.sleep(0.005)
         if response is None:
             self.log("channel.timeout", id=request.id, timeout=timeout)
         return response
