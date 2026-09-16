@@ -101,7 +101,7 @@ disagreed with.
 ## 4. Verification
 
 ```sh
-python3 -m unittest discover -s tests      # 160 tests
+python3 -m unittest discover -s tests      # 190 tests
 python3 -m krcheat --self-test             # 10 checks, in the shipped tool
 python3 -m krcheat doctor --oracle         # environment + a real VM load
 ```
@@ -211,4 +211,34 @@ old enough to refuse statically.
 4. **M3** — `krcheat/agent/kr_agent.c`: interpose `luaL_newstate` and `SDL_GL_SwapWindow`, then
    the channel loop. The protocol, the snippets and the override lifecycle are already specified
    and coded on the Python side, so M3 is native code and wiring, not design.
-5. **M7** — the GUI, once an interpreter with Tk 8.6+ is available.
+5. **M7** — *deferred by D10.* The GUI is written, shares `core/` and is opt-in
+   (`ui.enabled`), so nothing here blocks it; macOS use is CLI-only, and a front-end would be
+   picked up only if that decision changes (and only after M3, since the live panel is the part
+   worth showing).
+
+---
+
+## 7. Review of 2026-09-16 — what it found
+
+The review pass (static scan for unused imports and undeclared attribute accesses, the dev-mode
+suite with `ResourceWarning` promoted to an error, a property test for the codec, and a
+read-through of the whole tree) fixed these. Each has a regression test in
+`tests/test_regressions.py`, named after the behaviour that was wrong.
+
+| # | Finding | Why it mattered |
+| --- | --- | --- |
+| 1 | `Ctx.slot` passed the session's slot as *explicit* | A session slot whose file had been deleted raised exit 2 for the rest of the session, instead of falling back to the prompt. The two functions disagreed about what "session" means. |
+| 2 | `profile list` resolved a profile (and so prompted for a slot) before consulting the archive | Asking "which slot?" before printing the game's own id list is noise, and in a pipe it was a usage error. `list` is a reference command. |
+| 3 | `data set level` / `data revert` never ran the §15.3 gates | §10.6 says the F15 commands are subject to the same gates as a save edit, because they write into the game's read path. They did their own snapshot-and-write with nothing checked. |
+| 4 | Log pruning could delete the log file the current run had open | On macOS the handle survives the unlink, so the run would keep writing into a file nobody can find — losing the diagnostics it was collected for. |
+| 5 | `krcheat gui` imported the module that imports `tkinter` before the preflight | On a pyenv interpreter, where `_tkinter` is absent, a missing optional dependency surfaced as an internal error, a traceback and exit 6. See §5. |
+| 6 | The oracle child was started as `-m krcheat.core.oracle` | That depends on the working directory or on the package being pip-installed. It is now a bootstrap that puts the package's parent on `sys.path`. |
+| 7 | The `ps` snapshot was cached for the lifetime of the process | `krcheat gui` re-reads the game's state on a timer, so it reported whichever state was true when the window opened. The cache now has a 2 s TTL. |
+| 8 | `safety.oracle_check` read `ctx._bundle` directly | A private attribute, and it bypassed the caching in `Ctx.bundle()`. There is now a public `bundle_or_none()` for the optional checks. |
+| 9 | `write_path` had an unused `extra_snapshot_files` parameter | Dead, and a trap: it fed `backup.snapshot`, which refuses to run when any listed file is missing. Removed. |
+| 10 | `Archive` never closed its `ZipFile`; `Result.changed` duplicated `effective_changes`; unused imports throughout | Hygiene: a 342 MB archive held open, a second name for one property, ~60 unused `typing` imports. |
+| 11 | The codec had no property test | The new one generates random tables in the game's own style and asserts byte identity, value survival and stability, plus that a scalar edit rewrites exactly one line. It found two flaws in the *test* (empty tables, and table→scalar collapsing lines) before it found none in the codec. |
+
+Two things the review deliberately did **not** change: the no-op-writes-nothing behaviour (§3.1) and
+the refusal to auto-restore after a failed post-write verification (§3.4). Both are decisions, not
+oversights.

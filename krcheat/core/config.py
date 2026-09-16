@@ -32,6 +32,9 @@ game =
 save_dir =
 
 [ui]
+# The tkinter GUI is opt-in and is not part of the intended product on macOS: the CLI is
+# the whole tool (decision D10). Set this to true to enable `krcheat gui`.
+enabled = false
 # The GUI asks for confirmation before it writes, showing the --dry-run diff.
 confirm_before_write = true
 window_geometry = 1000x680
@@ -58,6 +61,7 @@ require_yes_when_steam_running = true
 DEFAULTS: Dict[str, Any] = {
     "paths.game": None,
     "paths.save_dir": None,
+    "ui.enabled": False,
     "ui.confirm_before_write": True,
     "ui.window_geometry": "1000x680",
     "ui.last_tab": "profile",
@@ -122,6 +126,22 @@ def split_key(key):
     if not section or not name:
         raise UsageError("invalid config key: {0!r}".format(key))
     return section, name
+
+
+#: The command that turns the GUI on, quoted in messages so the user never has to guess.
+GUI_ENABLE_HINT = "krcheat config set ui.enabled true"
+
+
+def gui_enabled(cfg):
+    """Whether `krcheat gui` is switched on (decision D10: it is opt-in, macOS use is CLI-only).
+
+    A config that cannot answer the question counts as "off": the GUI is optional, and a
+    broken config must not be the reason it starts.
+    """
+    try:
+        return bool(cfg.get_typed("ui.enabled"))
+    except Exception:
+        return False
 
 
 class Config(object):

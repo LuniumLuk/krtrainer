@@ -16,16 +16,12 @@ Two deliberate properties:
 from __future__ import annotations
 
 import os
-import platform
 import shutil
-import sys
-import sysconfig
-from typing import List, Optional
+from typing import List
 
-from krcheat import __version__
 from krcheat.core import config as config_mod
 from krcheat.core import log as log_mod
-from krcheat.core import mine, paths, safety
+from krcheat.core import mine, paths
 from krcheat.core.errors import EXIT_NOT_FOUND, EXIT_OK, EXIT_VALIDATION, KrcheatError
 from krcheat.core.result import Result
 from krcheat.core.safety import FAIL, PASS, WARN, Gate
@@ -328,7 +324,21 @@ def _check_tkinter(ctx):
     opens a window, which cannot be caught in-process — and probing it in a subprocess
     would show a macOS crash-report dialog, once per `doctor` run. `tkprobe` therefore
     only starts a Tk process when the version numbers say it is plausible.
+
+    When the GUI is switched off (the default, decision D10) there is nothing to warn
+    about: a component the user has decided not to use is not a finding.
     """
+    if not config_mod.gui_enabled(ctx.config):
+        return [
+            Gate(
+                "tkinter",
+                PASS,
+                "not requested (ui.enabled = false): the CLI is the whole tool. Enable the GUI "
+                "with '{0}'.".format(config_mod.GUI_ENABLE_HINT),
+                available=True,
+                enabled=False,
+            )
+        ]
     from krcheat.gui import tkprobe
 
     info = tkprobe.summary()

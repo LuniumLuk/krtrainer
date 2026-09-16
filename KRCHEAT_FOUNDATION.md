@@ -100,6 +100,7 @@ Recorded here so the rest of the document can be read against them. Each is norm
 | D7 | **The CLI is the foundation.** Operations live in `core/`; `cli.py` and `gui/` are thin renderers over the same functions, so a GUI bug cannot diverge from CLI behaviour. | §9.5 |
 | D8 | **File-based logging and configuration.** Append-only JSONL diagnostic log; `config.ini` for user settings and a separate `state.json` for machine-owned cache. | §9.6, §9.7 |
 | D9 | **Slot selection is explicit and never persisted.** `--slot N` is passed per call; within one trainer session the last explicit value is reused; the cache is cleared at every startup, and if no slot has been given the user is **asked**, never guessed at. | §9.7, §10.7 |
+| D10 | **macOS use is CLI-only, and F16 is deferred.** The tkinter wrapper stays in the tree as an optional renderer because it shares `core/` and costs nothing to keep, but it is **opt-in** (`ui.enabled`, default false) and no front-end work — no native port, no web UI — is planned. `doctor` therefore reports it as "not requested" rather than warning about a component nobody asked for. | §8.1, §9.5, §17, §20 |
 
 ---
 
@@ -547,7 +548,7 @@ dependency on Tk whatsoever.
 | F13 | Offline **bytecode patching** (permanent tweaks) | new | `game.love` copy | 3 |
 | F14 | **Backup / restore / doctor** | new | filesystem | 1 |
 | F15 | Persistent per-level data: **starting gold, starting lives, wave rewards** | "Gold"/"Health" as a *persistent* tweak rather than a live write | shadow data module (§9.8) | 1 (depends on S2; falls back to 3) |
-| F16 | **tkinter GUI wrapper** | the WinForms front end itself | `gui/` over `core/` (§9.5) | front-end |
+| F16 | **tkinter GUI wrapper** | the WinForms front end itself | `gui/` over `core/` (§9.5) | front-end (deferred, D10) |
 
 ### 8.2 Acceptance criteria
 
@@ -1377,7 +1378,7 @@ write was rejected).
 | M4 | **Live features** | `gold`, `lives`, `speed`, `god`, `always`, override lifecycle (§11.7) | M3 | 1–2 d |
 | M5 | **Transport B** | *if S2 held:* a generated file in the save dir (~0.5 d). *If not:* install/uninstall/repair with the ZIP repack (~1 d) | S2 | 0.5–1 d |
 | M6 | **Packaging and docs** | `pyproject.toml`, `pipx` install, README, troubleshooting | M4 | 0.5–1 d |
-| M7 | **GUI (F16)** | `gui/` over `core/`: profile panel, live panel, log pane, worker-thread marshalling, dialogs | M4, M6 | 2–3 d |
+| M7 | **GUI (F16)** — *deferred by D10: macOS use is CLI-only* | `gui/` over `core/`: profile panel, live panel, log pane, worker-thread marshalling, dialogs | M4, M6 | 2–3 d |
 | M8 | **Tier 3 (backlog)** | bytecode scanner/patcher with dry-run and oracle validation — only if S2 failed | S2 failed, M4 | 2–3 d |
 
 Ordering rationale: S2 runs first because its result changes the shape of M5 and can remove M8
@@ -1496,7 +1497,9 @@ would be friendlier. Decide after the first game update observed with F15 instal
 ## 20. Non-goals
 
 * No GUI toolkit other than tkinter, and no web/Electron UI. The tkinter wrapper of §9.5 is a
-  thin renderer over `core/`, not a second implementation.
+  thin renderer over `core/`, not a second implementation. **macOS use is CLI-only (D10):** the
+  wrapper is opt-in via `ui.enabled` and no front-end work is planned, so no other toolkit will
+  be adopted.
 * No Windows/Unity support; the existing trainer remains for that platform.
 * No bypass of Steam ownership/DRM checks.
 * No redistribution of game assets, bytecode or extracted data.

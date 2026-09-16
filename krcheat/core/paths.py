@@ -16,6 +16,7 @@ import hashlib
 import os
 import re
 import subprocess
+import time
 from typing import Callable, Dict, List, Optional
 
 from krcheat.core.errors import NotFoundError, UsageError
@@ -320,21 +321,30 @@ def resolve_slot(save_dir, explicit=None, session=None, ask=None, interactive=Tr
 # ---------------------------------------------------------------------------
 
 _PS_CACHE = {}
+#: How long a `ps` snapshot is trusted. Long-lived front-ends (`krcheat gui`) re-check the
+#: game's state on a timer, and a cache without an expiry would report the first answer
+#: for the rest of the session.
+_PS_TTL_SECONDS = 2.0
 
 
-def _ps_output():
-    if "out" not in _PS_CACHE:
-        try:
-            completed = subprocess.run(
-                ["ps", "-Ao", "pid=,args="],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                timeout=10,
-            )
-            _PS_CACHE["out"] = completed.stdout.decode("utf-8", "replace")
-        except Exception:
-            _PS_CACHE["out"] = ""
-    return _PS_CACHE["out"]
+def _ps_output(max_age=_PS_TTL_SECONDS):
+    now = time.time()
+    cached = _PS_CACHE.get("out")
+    if cached is not None and now - _PS_CACHE.get("at", 0.0) < max_age:
+        return cached
+    try:
+        completed = subprocess.run(
+            ["ps", "-Ao", "pid=,args="],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+        )
+        output = completed.stdout.decode("utf-8", "replace")
+    except Exception:
+        output = ""
+    _PS_CACHE["out"] = output
+    _PS_CACHE["at"] = time.time()
+    return output
 
 
 def _ps_lines():

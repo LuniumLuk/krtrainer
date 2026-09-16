@@ -81,7 +81,7 @@ _NOISE = {
 
 
 class Archive(object):
-    """A read-only view of `game.love`."""
+    """A read-only view of `game.love`. Use it as a context manager."""
 
     def __init__(self, bundle):
         self.bundle = bundle
@@ -91,6 +91,22 @@ class Archive(object):
         if self._zip is None:
             self._zip = zipfile.ZipFile(self.bundle.game_love, "r")
         return self._zip
+
+    def close(self):
+        """Release the handle. The archive is 342 MB; holding it open is not polite."""
+        if self._zip is not None:
+            try:
+                self._zip.close()
+            except Exception:
+                pass
+            self._zip = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self.close()
+        return False
 
     def names(self):
         try:
@@ -187,12 +203,15 @@ def mine_all(bundle, state=None, logger=None, use_cache=True):
             return cached
 
     archive = Archive(bundle)
-    result = {
-        "achievements": mine_achievements(archive),
-        "heroes": mine_heroes(archive),
-        "levels": mine_levels(archive),
-        "upgrades": mine_upgrades(archive),
-    }
+    try:
+        result = {
+            "achievements": mine_achievements(archive),
+            "heroes": mine_heroes(archive),
+            "levels": mine_levels(archive),
+            "upgrades": mine_upgrades(archive),
+        }
+    finally:
+        archive.close()
     if logger:
         logger.info(
             "mine.done",

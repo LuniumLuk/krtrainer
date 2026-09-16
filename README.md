@@ -158,11 +158,19 @@ Beyond that:
 
 ---
 
-## The GUI is unavailable on this machine (and that is handled)
+## The GUI is opt-in, and unavailable on this machine
 
-`krcheat gui` opens a tkinter front-end over the same `core/`, with the same safety model and no
-GUI-only operation. On the reference machine it **cannot run**, for two different reasons
-depending on the interpreter — and both are reported rather than crashing:
+**macOS use is CLI-only (decision D10).** `krcheat gui` is therefore **off by default**
+(`ui.enabled = false`), and `doctor` reports it as "not requested" rather than warning about a
+component you have decided not to use. Turn it on with:
+
+```sh
+krcheat config set ui.enabled true
+```
+
+When it is on, it is a tkinter front-end over the same `core/`, with the same safety model and no
+GUI-only operation. On this machine it still **cannot run**, for two different reasons depending on
+the interpreter — and both are reported rather than crashing:
 
 | Interpreter | What it has | What happens |
 | --- | --- | --- |
@@ -226,7 +234,7 @@ krtrainer/
 │   │   ├── live/               # tier 2: protocol + snippets real, agent absent (M3)
 │   │   └── patch/              # tier 3: backlog (M8)
 │   └── agent/                  # the injected dylib — not written yet (M3)
-└── tests/                      # 160 tests, stdlib unittest
+└── tests/                      # 190 tests, stdlib unittest
 ```
 
 The CLI is the foundation: all behaviour lives in `core/`, and both `cli.py` and `gui/` are thin
@@ -238,15 +246,17 @@ only one implementation.
 ## Tests
 
 ```sh
-python3 -m unittest discover -s tests -v     # 160 tests
+python3 -m unittest discover -s tests -v     # 190 tests
 python3 -m krcheat --self-test               # the same checks, in the shipped tool
 ```
 
-Layers, per the spec: **unit** (codec byte-identity over synthetic fixtures, targeted edits,
-backup hash verification, config preservation, state invalidation, operation ranges, the
-no-deletion guard), **oracle** (every fixture loaded in the game's own LuaJIT — skipped, not
-failed, when the game is not installed), **golden** (a checked-in *synthetic* save, never a real
-one), and **CLI end-to-end** (dispatch, exit codes, dry-run, snapshots).
+Layers, per the spec: **unit** (codec byte-identity over synthetic fixtures and over generated
+text, targeted edits, backup hash verification, config preservation, state invalidation, operation
+ranges, the no-deletion guard), **oracle** (every fixture loaded in the game's own LuaJIT —
+skipped, not failed, when the game is not installed), **golden** (a checked-in *synthetic* save,
+never a real one), **CLI end-to-end** (dispatch, exit codes, dry-run, snapshots), and
+**regression** (`test_regressions.py`: one test per bug found in the review of 2026-09-16, listed
+in [`IMPLEMENTATION.md`](IMPLEMENTATION.md#7-review-of-2026-09-16--what-it-found)).
 
 ---
 
@@ -262,7 +272,7 @@ one), and **CLI end-to-end** (dispatch, exit codes, dry-run, snapshots).
 | M3–M4 — live channel (agent, gold/lives/speed/god) | not started — commands exit 3 naming the milestone |
 | M5 — Transport B (bootstrap module) | not started, conditional on S2 |
 | M6 — Packaging and docs | partial (`pyproject.toml`, this README) |
-| M7 — tkinter GUI (F16) | **written**, but unusable on this machine's Tk 8.5 |
+| M7 — tkinter GUI (F16) | **written and opt-in** (`ui.enabled`), deferred by D10; unusable on this machine's Tk 8.5 |
 | M8 — Bytecode patcher | backlog, as designed |
 
 Two questions are still open and are listed as spikes rather than assumptions: **S2**

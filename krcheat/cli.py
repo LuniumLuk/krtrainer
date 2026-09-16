@@ -26,21 +26,14 @@ import json
 import os
 import sys
 import time
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict
 
 from krcheat import __version__
 from krcheat.core import backup, config as config_mod, context as context_mod
 from krcheat.core import data as data_mod, doctor as doctor_mod, log as log_mod, paths
 from krcheat.core import profile as profile_mod, selftest as selftest_mod
 from krcheat.core import state as state_mod
-from krcheat.core.errors import (
-    EXIT_INTERNAL,
-    EXIT_OK,
-    ChannelUnavailable,
-    KrcheatError,
-    UsageError,
-    milestone,
-)
+from krcheat.core.errors import EXIT_INTERNAL, EXIT_OK, KrcheatError, UsageError, milestone
 from krcheat.core.result import Result
 
 PROGRAM = "krcheat"
@@ -442,15 +435,14 @@ def _build_context(args, command, argv):
     except KrcheatError:
         cfg = config_mod.Config(path=paths.config_path(), text="")
 
-    if level:
-        pass
-    elif verbose:
-        level = "debug"
-    else:
-        try:
-            level = cfg.get_typed("logging.level") or "info"
-        except Exception:
-            level = "info"
+    if level is None:
+        if verbose:
+            level = "debug"
+        else:
+            try:
+                level = cfg.get_typed("logging.level") or "info"
+            except Exception:
+                level = "info"
 
     logger = log_mod.configure(
         level=level,
@@ -589,21 +581,27 @@ def cmd_profile(ctx, args):
 
 
 def _profile_list(ctx, args):
+    """`profile list` is a reference command.
+
+    It answers from the archive when it can, so it must not prompt for a slot: asking
+    "which slot?" before printing the game's own id list is noise. A slot is only loaded
+    when it was passed explicitly, or when the answer genuinely lives in a save.
+    """
     kind = args.kind
+    needs_save = kind == "counters"
     profile = None
-    if kind == "counters":
-        profile = _load_profile(ctx, args)
-    elif kind in ("achievements", "heroes", "levels", "upgrades"):
-        # Deliberately not slot-dependent when the archive can answer: `list` is a
-        # reference command, and prompting for a slot to print the game's own id list
-        # would be noise.
+    if needs_save or getattr(args, "slot", None) is not None:
         try:
             profile = _load_profile(ctx, args)
         except KrcheatError:
+            if needs_save:
+                raise
             profile = None
     values = profile_mod.list_ids(ctx, kind, profile=profile)
     result = Result(command="profile.list")
     result.set(kind=kind, count=len(values), ids=values)
+    if profile is None and kind != "levels":
+        result.note("ids mined from the archive; pass --slot N to merge in a save's own keys")
     return result
 
 
@@ -766,6 +764,9 @@ def cmd_log(ctx, args):
         removed = log_mod.prune_logs(
             keep_days=_cfg_int(ctx.config, "logging.retention_days", log_mod.DEFAULT_KEEP_DAYS),
             max_bytes=_cfg_int(ctx.config, "logging.max_total_mb", 20) * 1024 * 1024,
+            # This run holds the current log open; deleting it underneath would lose the
+            # records being written right now.
+            protect=ctx.log.path,
         )
         result = Result(command="log.prune")
         result.set(removed=removed, removed_count=len(removed), kept=log_mod.log_files())
@@ -920,6 +921,12 @@ def cmd_patch(ctx, args):
 
 
 def cmd_gui(ctx, args):
+    """The GUI is opt-in (decision D10): macOS use is CLI-only, so it is off by default."""
+    if not config_mod.gui_enabled(ctx.config):
+        raise UsageError(
+            "the GUI is disabled (ui.enabled = false). Enable it with '{0}', or keep using "
+            "the CLI \u2014 every operation is available there.".format(config_mod.GUI_ENABLE_HINT)
+        )
     from krcheat.gui import run as gui_run
 
     code = gui_run(ctx)
@@ -968,9 +975,7 @@ def _render(ctx, result, stream):
     if ctx.json_output:
         stream.write(json.dumps(result.to_dict(), indent=2, ensure_ascii=False) + "\n")
     else:
-        renderer = RENDERERS.get(result.command.split(".")[0], _render_generic)
-        if result.command in RENDERERS:
-            renderer = RENDERERS[result.command]
+        renderer = RENDERERS.get(result.command, _render_generic)
         try:
             renderer(result, stream)
         except Exception as exc:  # rendering must never lose the result
@@ -1131,7 +1136,8 @@ def _render_backup_prune(result, stream):
 
 def _render_log_tail(result, stream):
     records = result.payload.get("records", [])
-    stream.write("# {0} record(s) from {1}\n".format(len(records), result.payload.get("path")))
+    source = result.payload.get("path") or "(no log file yet)"
+    stream.write("# {0} record(s) from {1}\n".format(len(records), source))
     for record in records:
         if "raw" in record and len(record) == 1:
             stream.write("  {0}\n".format(record["raw"]))

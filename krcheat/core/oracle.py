@@ -56,7 +56,21 @@ LUA_OK = 0
 MAX_DEPTH = 24
 MAX_ENTRIES = 200000
 
-CHILD_MODULE = "krcheat.core.oracle"
+#: The directory that contains the `krcheat` package, used to start the child.
+PACKAGE_PARENT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def _bootstrap():
+    """The `-c` program the child runs.
+
+    Putting the package's parent on `sys.path` explicitly means the child does not depend
+    on the working directory or on the tool being pip-installed, which `-m
+    krcheat.core.oracle` did.
+    """
+    return (
+        "import sys; sys.path.insert(0, {0!r}); "
+        "from krcheat.core.oracle import _main; raise SystemExit(_main())"
+    ).format(PACKAGE_PARENT)
 
 
 def framework_path(bundle=None):
@@ -86,6 +100,10 @@ def check(text, name="<chunk>", mode="run", bundle=None, timeout=20.0, python=No
 
     Returns a dict: `{ok, mode, error, value, crash, skipped}`. Never raises: the
     oracle is an enhancement, so its failure must be reportable, not fatal.
+
+    The child is started with a bootstrap that puts the package's parent on `sys.path`,
+    so this works from any working directory and whatever the tool was installed as —
+    relying on `-m krcheat.core.oracle` needed the caller's cwd to be right.
     """
     path = framework_path(bundle)
     if path is None:
@@ -93,7 +111,7 @@ def check(text, name="<chunk>", mode="run", bundle=None, timeout=20.0, python=No
     payload = json.dumps({"framework": path, "name": name, "mode": mode, "source": text})
     try:
         completed = subprocess.run(
-            [python or sys.executable, "-m", CHILD_MODULE],
+            [python or sys.executable, "-c", _bootstrap()],
             input=payload.encode("utf-8"),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

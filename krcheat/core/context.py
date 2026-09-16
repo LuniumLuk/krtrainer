@@ -21,7 +21,7 @@ from krcheat.core import config as config_mod
 from krcheat.core import log as log_mod
 from krcheat.core import paths
 from krcheat.core import state as state_mod
-from krcheat.core.errors import UsageError
+from krcheat.core.errors import KrcheatError, UsageError
 
 
 @dataclass
@@ -65,6 +65,17 @@ class Ctx(object):
                                expected_version_string=self._bundle.expected_version_string())
         return self._bundle
 
+    def bundle_or_none(self):
+        """The app bundle, or None when it cannot be found.
+
+        For checks that are optional by design — the oracle, the version-string signal —
+        where a missing game must degrade the check rather than fail the run.
+        """
+        try:
+            return self.bundle()
+        except KrcheatError:
+            return None
+
     def save_dir(self):
         """The save directory, resolved once. May raise `NotFoundError`."""
         if self._save_dir is None:
@@ -76,11 +87,17 @@ class Ctx(object):
         return self._save_dir
 
     def slot(self, explicit=None, ask=None):
-        """Resolve the slot for a profile command (§10.7)."""
+        """Resolve the slot for a profile command (§10.7 step 1 > 2 > 3 > 4).
+
+        The session's slot is passed as *session*, not as *explicit*: a session value whose
+        file has since been deleted must fall through to the prompt, whereas an explicit
+        `--slot` for a missing file is a hard error. Conflating the two made a deleted slot
+        unaskable-about for the rest of the session.
+        """
         number = paths.resolve_slot(
             self.save_dir(),
-            explicit=explicit if explicit is not None else self.session.get("slot"),
-            session=None,
+            explicit=explicit,
+            session=self.session.get("slot"),
             ask=ask,
             interactive=self.interactive,
         )

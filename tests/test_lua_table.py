@@ -1,6 +1,7 @@
 """Codec tests — the byte-identity invariant is the primary one (§16.2, D1)."""
 
 import os
+import random
 import sys
 import unittest
 
@@ -135,6 +136,113 @@ class TestRejections(unittest.TestCase):
         missing = lt.flatten_paths(before) - lt.flatten_paths(after)
         self.assertIn("upgrades.archers", missing)
         self.assertIn("levels.1.stars", missing)
+
+
+class TestGeneratedText(unittest.TestCase):
+    """Randomly shaped tables, written in the game's own style, must round-trip.
+
+    The parser is the load-bearing component: mis-read a shape the game can emit and the
+    writer re-emits it wrongly, or refuses a valid file. Sweeping the shape space finds
+    that class of bug far faster than hand-written fixtures do.
+    """
+
+    def render_table(self, value, indent=0):
+        pad = "\t" * (indent + 1)
+        lines = ["{\n"]
+        for key in sorted(value, key=lambda item: (isinstance(item, str), item)):
+            item = value[key]
+            rendered = (
+                self.render_table(item, indent + 1)
+                if isinstance(item, dict)
+                else lt.render_scalar(item).text
+            )
+            lines.append("{0}{1} = {2};\n".format(pad, lt.render_key(key), rendered))
+        lines.append("{0}}}".format("\t" * indent))
+        return "".join(lines)
+
+    def chunk_for(self, value):
+        return "local obj1 = {0}\nreturn obj1\n".format(self.render_table(value))
+
+    def random_scalar(self, rng):
+        kind = rng.choice(("int", "float", "bool", "str"))
+        if kind == "int":
+            return rng.randint(-(2 ** 31), 2 ** 31)
+        if kind == "float":
+            return rng.choice(
+                [0.0, -0.5, 0.1, 1 / 3, 0.021276595745681, rng.uniform(-1000, 1000)]
+            )
+        if kind == "bool":
+            return rng.choice([True, False])
+        return rng.choice(
+            ["", "plain", 'quo"te', "tab\there", "nl\nhere", "\u00fcn\u00efcode", "back\\slash"]
+        )
+
+    def random_table(self, rng, depth=0):
+        table = {}
+        for _ in range(rng.randint(0, 4)):
+            key = (
+                rng.choice(["alpha", "beta", 'we"ird'])
+                if rng.random() < 0.7
+                else rng.randint(1, 6)
+            )
+            if depth < 2 and rng.random() < 0.35:
+                table[key] = self.random_table(rng, depth + 1)
+            else:
+                table[key] = self.random_scalar(rng)
+        return table
+
+    def test_generated_text_round_trips_and_is_stable(self):
+        rng = random.Random(20260916)
+        for index in range(150):
+            value = self.random_table(rng)
+            text = self.chunk_for(value)
+            with self.subTest(case=index, text=text[:60]):
+                doc = lt.parse(text)
+                self.assertEqual(doc.render(), text, "read/write is not byte-identical")
+                self.assertEqual(doc.python(), value, "values did not survive the round trip")
+                self.assertEqual(lt.parse(doc.render()).render(), text, "not stable on re-read")
+
+    def test_an_edit_touches_exactly_one_line(self):
+        """Scalar for scalar, an edit must rewrite one line and disturb no other.
+
+        Only scalar targets are used: replacing a *table* with a scalar legitimately
+        changes the line count, which would test the renderer's layout rather than the
+        verbatim re-emission that D1 is about.
+        """
+        rng = random.Random(7)
+        checked = 0
+        for index in range(80):
+            value = self.random_table(rng)
+            scalars = [
+                key
+                for key in sorted(value, key=lambda item: (isinstance(item, str), item))
+                if not isinstance(value[key], dict)
+            ]
+            if not scalars:
+                continue
+            target = scalars[0]
+            replacement = 12345 if not isinstance(value[target], str) else "sentinel"
+            if replacement == value[target]:
+                replacement = 99999
+            text = self.chunk_for(value)
+            doc = lt.parse(text)
+            self.assertTrue(doc.set(target, replacement))
+            out = doc.render()
+            checked += 1
+            with self.subTest(case=index, target=target):
+                self.assertEqual(lt.parse(out).python()[target], replacement)
+                out_lines, text_lines = out.splitlines(), text.splitlines()
+                self.assertEqual(len(out_lines), len(text_lines))
+                differing = [
+                    position
+                    for position, pair in enumerate(zip(out_lines, text_lines))
+                    if pair[0] != pair[1]
+                ]
+                self.assertEqual(
+                    len(differing), 1, "an edit changed more than one line: {0}".format(differing)
+                )
+                self.assertIn(lt.render_key(target), out_lines[differing[0]])
+        self.assertGreater(checked, 30, "the generator produced too few scalar targets")
 
 
 if __name__ == "__main__":

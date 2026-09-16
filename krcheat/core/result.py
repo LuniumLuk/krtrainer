@@ -90,12 +90,9 @@ class Result:
     # -- introspection -------------------------------------------------------
 
     @property
-    def changed(self):
-        return [c for c in self.changes if not c.noop]
-
-    @property
     def effective_changes(self):
-        return [c for c in self.changes if not c.noop]
+        """The changes that actually alter something (a no-op is not a change)."""
+        return [change for change in self.changes if not change.noop]
 
     def to_dict(self):
         return {

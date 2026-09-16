@@ -141,13 +141,8 @@ def _check_creation():
 
 
 def _check_rejection():
-    doc = lt.parse(FIXTURE)
-    doc.set("gems", 1)
-    # Simulate a writer that lost a key, which must be refused (the game deletes a slot
-    # whose mandatory data is missing, §5.1).
-    broken = lt.parse(
-        "local obj1 = {\n\t[\"gems\"] = 1;\n}\nreturn obj1\n".encode("utf-8").decode("utf-8")
-    )
+    """The writer must never be able to lose a key (§12.3)."""
+    broken = lt.parse('local obj1 = {\n\t["gems"] = 1;\n}\nreturn obj1\n')
     try:
         safety.validate_text(broken.render(), broken.python(), lt.parse(FIXTURE).python())
     except Exception as exc:

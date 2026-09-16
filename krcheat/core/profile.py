@@ -493,7 +493,7 @@ class Profile(object):
             result.warnings.extend(
                 safety.check_gates(
                     ctx,
-                    bundle=_maybe_bundle(ctx),
+                    bundle=ctx.bundle_or_none(),
                     save_dir=self.save_dir,
                     version_string=self.version_string,
                     target_path=self.path,
@@ -516,13 +516,6 @@ class Profile(object):
             version_string=self.version_string,
         )
         return result
-
-
-def _maybe_bundle(ctx):
-    try:
-        return ctx.bundle()
-    except KrcheatError:
-        return None
 
 
 def _safe_get(doc, key):

@@ -205,15 +205,15 @@ def expand_fields(field, value):
 
 def _extract_original(ctx, save_dir, module_name, result):
     """Copy the shipped module out of `game.love` so the shadow can call it."""
-    archive = mine.Archive(ctx.bundle())
-    if not archive.has(module_name):
-        raise NotFoundError(
-            "{0} is not in the archive; this level has no data module to override".format(
-                module_name
-            ),
-            module=module_name,
-        )
-    data = archive.read(module_name)
+    with mine.Archive(ctx.bundle()) as archive:
+        if not archive.has(module_name):
+            raise NotFoundError(
+                "{0} is not in the archive; this level has no data module to override".format(
+                    module_name
+                ),
+                module=module_name,
+            )
+        data = archive.read(module_name)
     if not data:
         raise ValidationError("could not read {0} from the archive".format(module_name))
     if not data.startswith(b"\x1bLJ"):
@@ -245,6 +245,9 @@ def set_level_data(ctx, result, level, field, value, save_dir=None):
             "unknown level field {0!r}; expected starting_gold or starting_lives".format(field)
         )
     save_dir = save_dir or ctx.save_dir()
+    # §10.6: `data *` writes into the game's *read* path, so it is subject to the same
+    # gates as a save edit — the game must not be running, and Steam gets its warning.
+    _gates(ctx, save_dir)
     module_name = level_module_name(level)
     target = shadow_path(save_dir, module_name)
 
@@ -350,6 +353,7 @@ def revert(ctx, result, level=None, save_dir=None):
         )
         return result
 
+    _gates(ctx, save_dir)
     files = [item["path"] for item in installed]
     files += [item["original_copy"] for item in installed if item.get("original_copy") and os.path.exists(item["original_copy"])]
     if not ctx.dry_run:
@@ -440,6 +444,19 @@ def _rel(path, root):
         return os.path.relpath(path, root)
     except ValueError:
         return path
+
+
+def _gates(ctx, save_dir):
+    """The §15.3 preconditions, shared by the F15 commands (which write into the game's
+    read path, so they get the same treatment as a save edit)."""
+    from krcheat.core import safety as safety_mod
+
+    return safety_mod.check_gates(
+        ctx,
+        bundle=ctx.bundle_or_none(),
+        save_dir=save_dir,
+        version_string=_version_of(ctx),
+    )
 
 
 def _prune_empty_dirs(directory, stop):

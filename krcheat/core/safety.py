@@ -185,7 +185,7 @@ def oracle_check(ctx, text, name, run=True, warnings=None):
     """
     from krcheat.core import oracle as oracle_mod
 
-    if not ctx.oracle or not oracle_mod.available(ctx._bundle if ctx._bundle else None):
+    if not ctx.oracle or not oracle_mod.available(ctx.bundle_or_none()):
         ctx.log_debug("oracle.skipped", reason="disabled or unavailable", name=name)
         return {"ok": False, "skipped": True}
     result = oracle_mod.check(text, name=name, mode="run" if run else "load")
@@ -227,7 +227,6 @@ def write_path(
     original,
     label,
     version_string=None,
-    extra_snapshot_files=None,
 ):
     """Steps 1-4 of §15.2 for one file. Returns the snapshot manifest (or None).
 
@@ -257,7 +256,7 @@ def write_path(
         return None
 
     # -- step 1: snapshot before the first write ----------------------------
-    files = [target] + list(extra_snapshot_files or [])
+    files = [target]
     manifest = backup.snapshot(
         files,
         label=label,

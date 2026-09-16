@@ -234,7 +234,9 @@ def configure(
     set_logger(logger)
     if prune and enabled:
         try:
-            prune_logs(keep_days=keep_days, max_bytes=max_bytes)
+            # Never prune the file this run holds open: on macOS the handle survives the
+            # unlink, so the run would log into nothing and lose its own diagnostics.
+            prune_logs(keep_days=keep_days, max_bytes=max_bytes, protect=logger.path)
         except Exception:
             pass
     return logger
@@ -280,22 +282,29 @@ def read_records(path, limit=None):
 
 
 def tail_lines(count=40):
-    """The last `count` records across the newest log files."""
+    """The last `count` records across the newest log files, and the file they came from."""
     records = []
-    for path in reversed(log_files()):
+    files = log_files()
+    for path in reversed(files):
         records = read_records(path) + records
         if len(records) >= count:
             break
-    return records[-count:], (log_files()[-1] if log_files() else None)
+    return records[-count:], (files[-1] if files else None)
 
 
-def prune_logs(keep_days=DEFAULT_KEEP_DAYS, max_bytes=DEFAULT_MAX_BYTES, now=None):
-    """Apply the retention policy (§9.6 rule 2). Returns what was removed."""
+def prune_logs(keep_days=DEFAULT_KEEP_DAYS, max_bytes=DEFAULT_MAX_BYTES, now=None, protect=None):
+    """Apply the retention policy (§9.6 rule 2). Returns what was removed.
+
+    `protect` is a path that must survive: the file the current run has open.
+    """
     removed = []
     now = now or datetime.datetime.now()
+    protected = os.path.abspath(protect) if protect else None
     files = log_files()
     # by age
     for path in files:
+        if protected and os.path.abspath(path) == protected:
+            continue
         try:
             mtime = datetime.datetime.fromtimestamp(os.path.getmtime(path))
         except OSError:
@@ -318,6 +327,8 @@ def prune_logs(keep_days=DEFAULT_KEEP_DAYS, max_bytes=DEFAULT_MAX_BYTES, now=Non
     for path, size in sizes:
         if total <= int(max_bytes):
             break
+        if protected and os.path.abspath(path) == protected:
+            continue
         try:
             os.remove(path)
             removed.append(path)
