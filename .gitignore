@@ -1,0 +1,42 @@
+# --- macOS ---
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+
+# --- editors / IDEs ---
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# --- natural-code artifacts (injected agent) ---
+*.o
+*.dylib
+
+# --- local runtime state (never commit) ---
+.krcheat/
+*.local.toml
+
+# --- game artifacts: must never be committed ---
+# Extracted game content, bytecode and archives are proprietary.
+*.love
+game.love
+slot_*.lua
+settings.lua
+global.lua
