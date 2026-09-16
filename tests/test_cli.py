@@ -1,5 +1,6 @@
 """End-to-end CLI tests: dispatch, rendering, exit codes (§10)."""
 
+import argparse
 import contextlib
 import io
 import json
@@ -286,6 +287,53 @@ class TestDataCommands(CliCase):
     def test_unknown_level_field_is_a_usage_error(self):
         code, _out, err = self.run_cli("data", "set", "level", "1", "starting_ponies", "2")
         self.assertEqual(code, 1)
+
+
+class TestHelpSurface(unittest.TestCase):
+    """Every action must be visible in `--help`.
+
+    argparse only lists a sub-action that was given `help=` text — without it the action is
+    silently invisible, so `krcheat data --help` used to print nothing at all. The cheatsheet
+    is checked against this surface, so a hidden action is a documentation bug waiting to
+    happen.
+    """
+
+    def _subparser_actions(self, parser):
+        for action in parser._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                yield action
+                for child in action.choices.values():
+                    for nested in self._subparser_actions(child):
+                        yield nested
+
+    def test_every_sub_action_has_help_text(self):
+        parser = cli.build_parser()
+        missing = []
+        for action in self._subparser_actions(parser):
+            documented = {item.dest for item in action._choices_actions}
+            for name in sorted(set(action.choices)):
+                if name not in documented:
+                    missing.append("{0} {1}".format(action.dest or "<root>", name))
+        self.assertEqual(missing, [], "hidden from --help: {0}".format(", ".join(missing)))
+
+    def test_top_level_help_lists_every_command(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), self.assertRaises(SystemExit):
+            cli.build_parser().parse_args(["--help"])
+        text = out.getvalue()
+        for command in (
+            "doctor", "profile", "backup", "log", "config", "data", "live", "play",
+            "install", "uninstall", "repair", "patch", "self-test", "gui",
+        ):
+            self.assertIn(command, text)
+
+    def test_data_help_lists_its_actions(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), self.assertRaises(SystemExit):
+            cli.build_parser().parse_args(["data", "--help"])
+        text = out.getvalue()
+        for action in ("list", "set", "revert"):
+            self.assertIn(action, text)
 
 
 if __name__ == "__main__":

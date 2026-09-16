@@ -148,54 +148,59 @@ def build_parser():
     setter_sub.required = True
 
     gems = setter_sub.add_parser("gems", help="set the premium currency")
-    gems.add_argument("value")
+    gems.add_argument("value", help="new balance")
 
     difficulty = setter_sub.add_parser("difficulty", help="set the last-used difficulty (1-4)")
-    difficulty.add_argument("value")
+    difficulty.add_argument("value", help="1 easy, 2 normal, 3 hard, 4 impossible")
 
     upgrades = setter_sub.add_parser("upgrades", help="all=5, or archers=5,barracks=3")
-    upgrades.add_argument("spec")
+    upgrades.add_argument("spec", help="category=level pairs, or all=<level>")
 
     stars = setter_sub.add_parser("stars", help="mark levels complete")
-    stars.add_argument("scope", choices=("all",))
+    stars.add_argument("scope", choices=("all",), help="the only supported scope")
     stars.add_argument("--stars", type=int, default=3, help="stars per level (0-3, default 3)")
     stars.add_argument("--levels", help="comma-separated level ids (default: every story level)")
-    stars.add_argument("--include-endless", dest="include_endless", action="store_true")
+    stars.add_argument(
+        "--include-endless",
+        dest="include_endless",
+        action="store_true",
+        help="also mark the endless levels the save already has",
+    )
 
     level = setter_sub.add_parser("level", help="tune one level")
-    level.add_argument("number")
+    level.add_argument("number", help="level id, e.g. 19 or 81")
     level_sub = level.add_subparsers(dest="level_action", metavar="<action>")
     level_sub.required = True
-    level_stars = level_sub.add_parser("stars")
-    level_stars.add_argument("stars", nargs="?", default=None)
+    level_stars = level_sub.add_parser("stars", help="set the star count")
+    level_stars.add_argument("stars", nargs="?", default=None, help="0-3")
     level_stars.add_argument("--mode", choices=tuple(sorted(profile_mod.MODE_INDEX)))
-    level_clear = level_sub.add_parser("clear")
+    level_clear = level_sub.add_parser("clear", help="set a mode's completion flag to 0")
     level_clear.add_argument("--mode", choices=tuple(sorted(profile_mod.MODE_INDEX)))
 
     hero = setter_sub.add_parser("hero", help="hero experience (skills are refused: H6)")
-    hero.add_argument("hero")
+    hero.add_argument("hero", help="hero id, e.g. hero_magnus")
     hero_sub = hero.add_subparsers(dest="hero_action", metavar="<action>")
     hero_sub.required = True
-    hero_xp = hero_sub.add_parser("xp")
+    hero_xp = hero_sub.add_parser("xp", help="set experience")
     hero_xp.add_argument("value")
-    hero_skills = hero_sub.add_parser("skills")
+    hero_skills = hero_sub.add_parser("skills", help="refused: the valid range is unknown (H6)")
     hero_skills.add_argument("spec")
 
     achievements = setter_sub.add_parser("achievements", help="all | none | ID[,ID...]")
-    achievements.add_argument("spec")
+    achievements.add_argument("spec", help="'all', 'none', or one or more ids")
 
     counters = setter_sub.add_parser("counters", help="set one achievement counter")
-    counters.add_argument("achievement")
+    counters.add_argument("achievement", help="counter id, e.g. DIE_HARD")
     counters.add_argument("value")
 
     seen = setter_sub.add_parser("seen", help="mark every seen.* entry true")
-    seen.add_argument("scope", choices=("all",))
+    seen.add_argument("scope", choices=("all",), help="the only supported scope")
 
     path_set = setter_sub.add_parser(
         "path", help="extension: set any dotted path (e.g. achievements.FIRST_BLOOD true)"
     )
-    path_set.add_argument("path")
-    path_set.add_argument("value")
+    path_set.add_argument("path", help="dotted path, e.g. levels.7.stars")
+    path_set.add_argument("value", help="int, float, true/false, or a string")
 
     # -- backup --------------------------------------------------------------
     backup_parser = sub.add_parser("backup", help="snapshots")
@@ -204,10 +209,13 @@ def build_parser():
     backup_sub.required = True
     backup_sub.add_parser("list", help="list snapshots")
     restore = backup_sub.add_parser("restore", help="restore a snapshot byte-identically")
-    restore.add_argument("id", nargs="?", default="latest")
-    restore.add_argument("--verify-only", dest="verify_only", action="store_true")
+    restore.add_argument("id", nargs="?", default="latest", help="snapshot id, a unique prefix, or 'latest'")
+    restore.add_argument(
+        "--verify-only", dest="verify_only", action="store_true",
+        help="check the snapshot's hashes without writing anything",
+    )
     prune = backup_sub.add_parser("prune", help="keep only the newest N snapshots")
-    prune.add_argument("--keep", type=int, default=20)
+    prune.add_argument("--keep", type=int, default=20, help="how many to keep (default 20)")
 
     # -- log -----------------------------------------------------------------
     log_parser = sub.add_parser("log", help="the JSONL diagnostic log")
@@ -215,7 +223,7 @@ def build_parser():
     log_sub = log_parser.add_subparsers(dest="log_action", metavar="<action>")
     log_sub.required = True
     tail = log_sub.add_parser("tail", help="print the tail of the log")
-    tail.add_argument("--lines", type=int, default=40)
+    tail.add_argument("--lines", type=int, default=40, help="how many records (default 40)")
     tail.add_argument("--event", help="only records whose event contains this string")
     log_sub.add_parser("path", help="print the active log path")
     log_sub.add_parser("prune", help="apply the retention policy now")
@@ -226,33 +234,33 @@ def build_parser():
     config_sub = config_parser.add_subparsers(dest="config_action", metavar="<action>")
     config_sub.required = True
     config_sub.add_parser("list", help="show every key with its effective value")
-    config_get = config_sub.add_parser("get")
-    config_get.add_argument("key")
-    config_set = config_sub.add_parser("set")
-    config_set.add_argument("key")
+    config_get = config_sub.add_parser("get", help="read one key")
+    config_get.add_argument("key", help="section.key, e.g. logging.level")
+    config_set = config_sub.add_parser("set", help="write one key, preserving comments")
+    config_set.add_argument("key", help="section.key, e.g. ui.enabled")
     config_set.add_argument("value")
-    config_sub.add_parser("path")
+    config_sub.add_parser("path", help="print the config file path")
 
     # -- data (F15) ----------------------------------------------------------
     data_parser = sub.add_parser("data", help="F15: persistent per-level data (needs spike S2)")
     add_global_flags(data_parser, suppress=True)
     data_sub = data_parser.add_subparsers(dest="data_action", metavar="<action>")
     data_sub.required = True
-    data_sub.add_parser("list")
-    data_set = data_sub.add_parser("set")
+    data_sub.add_parser("list", help="what can be overridden, and what is installed")
+    data_set = data_sub.add_parser("set", help="generate or extend an override")
     data_set_sub = data_set.add_subparsers(dest="target", metavar="<target>")
     data_set_sub.required = True
-    data_level = data_set_sub.add_parser("level")
-    data_level.add_argument("number")
+    data_level = data_set_sub.add_parser("level", help="per-level starting gold or lives")
+    data_level.add_argument("number", help="level id")
     data_level.add_argument("field", help="starting_gold | starting_lives")
     data_level.add_argument("value")
-    data_wave = data_set_sub.add_parser("wave")
-    data_wave.add_argument("number")
+    data_wave = data_set_sub.add_parser("wave", help="wave rewards (refused: shape unverified)")
+    data_wave.add_argument("number", help="level id")
     data_wave.add_argument("field")
     data_wave.add_argument("value")
     data_wave.add_argument("--mode", default="campaign")
-    data_revert = data_sub.add_parser("revert")
-    data_revert.add_argument("--level", type=int)
+    data_revert = data_sub.add_parser("revert", help="remove overrides; shipped values return")
+    data_revert.add_argument("--level", type=int, help="only this level")
     data_revert.add_argument("--all", dest="revert_all", action="store_true")
 
     # -- live (tier 2) -------------------------------------------------------
@@ -260,19 +268,19 @@ def build_parser():
     add_global_flags(live, suppress=True)
     live_sub = live.add_subparsers(dest="live_action", metavar="<action>")
     live_sub.required = True
-    live_sub.add_parser("status")
-    probe = live_sub.add_parser("probe")
-    probe.add_argument("--out", metavar="FILE")
+    live_sub.add_parser("status", help="channel health, transports, active overrides")
+    probe = live_sub.add_parser("probe", help="dump the game's globals to resolve field paths")
+    probe.add_argument("--out", metavar="FILE", help="write the dump here")
     for name in ("gold", "lives"):
-        item = live_sub.add_parser(name)
+        item = live_sub.add_parser(name, help="set, force, or release a value")
         item.add_argument("value", help="N | infinity | off")
-    speed = live_sub.add_parser("speed")
+    speed = live_sub.add_parser("speed", help="simulation multiplier")
     speed.add_argument("value", help="multiplier | off")
-    god = live_sub.add_parser("god")
+    god = live_sub.add_parser("god", help="disable life checking")
     god.add_argument("state", choices=("on", "off"))
-    evaluate = live_sub.add_parser("eval")
+    evaluate = live_sub.add_parser("eval", help="evaluate Lua once and print the result")
     evaluate.add_argument("code")
-    live_sub.add_parser("watch")
+    live_sub.add_parser("watch", help="interactive prompt, until Ctrl-D")
 
     # -- install / play / patch ---------------------------------------------
     play = sub.add_parser("play", help="launch the game with the agent loaded (not built yet)")
@@ -292,12 +300,12 @@ def build_parser():
     add_global_flags(patch, suppress=True)
     patch_sub = patch.add_subparsers(dest="patch_action", metavar="<action>")
     patch_sub.required = True
-    scan = patch_sub.add_parser("scan")
+    scan = patch_sub.add_parser("scan", help="find constants in a module's bytecode")
     scan.add_argument("value")
-    scan.add_argument("--module", metavar="PATH")
+    scan.add_argument("--module", metavar="PATH", help="which module to scan")
     scan.add_argument("--type", dest="value_type", choices=("number", "int"), default="number")
-    patch_sub.add_parser("apply")
-    patch_sub.add_parser("restore")
+    patch_sub.add_parser("apply", help="write a patched copy of the archive")
+    patch_sub.add_parser("restore", help="restore the pristine archive")
 
     # -- selftest / gui ------------------------------------------------------
     sub.add_parser("self-test", help="regression guard: codec, backup, config, state")

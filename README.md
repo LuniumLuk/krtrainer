@@ -198,12 +198,13 @@ To get a working GUI, install an interpreter built against Tk 8.6+ (a python.org
 
 | Document | Purpose |
 | --- | --- |
+| [`CHEATSHEET.md`](CHEATSHEET.md) | **Start here if you just want to use it.** One page: slots, recipes, undo, the safety gates, exit codes. |
 | [`KRCHEAT_FOUNDATION.md`](KRCHEAT_FOUNDATION.md) | **Canonical specification.** Target profile with per-fact evidence, module architecture, persistence model, runtime state model, extension surface, feature spec, CLI contract, live-channel protocol, save codec spec, safety model, testing plan, roadmap, risk register, open questions, appendices. |
 | [`MACOS_TRAINER_PROPOSAL.md`](MACOS_TRAINER_PROPOSAL.md) | The earlier, shorter proposal. Superseded by the foundation document where they disagree. |
 | [`IMPLEMENTATION.md`](IMPLEMENTATION.md) | How the implementation maps onto the spec: module by module, what is built, what is not, and where the code deliberately goes further. |
 
-Suggested reading order: foundation §2 (executive summary) → §3 (target profile) → §5
-(persistence) → §8–§10 (features, architecture, CLI).
+Suggested reading order: the cheatsheet to use it, then foundation §2 (executive summary) → §3
+(target profile) → §5 (persistence) → §8–§10 (features, architecture, CLI).
 
 ---
 
@@ -212,6 +213,7 @@ Suggested reading order: foundation §2 (executive summary) → §3 (target prof
 ```
 krtrainer/
 ├── KRCHEAT_FOUNDATION.md       # canonical spec
+├── CHEATSHEET.md               # one-page command reference
 ├── MACOS_TRAINER_PROPOSAL.md   # earlier proposal
 ├── IMPLEMENTATION.md           # implementation notes and deviations
 ├── pyproject.toml
@@ -234,7 +236,7 @@ krtrainer/
 │   │   ├── live/               # tier 2: protocol + snippets real, agent absent (M3)
 │   │   └── patch/              # tier 3: backlog (M8)
 │   └── agent/                  # the injected dylib — not written yet (M3)
-└── tests/                      # 190 tests, stdlib unittest
+└── tests/                      # 193 tests, stdlib unittest
 ```
 
 The CLI is the foundation: all behaviour lives in `core/`, and both `cli.py` and `gui/` are thin
@@ -246,7 +248,7 @@ only one implementation.
 ## Tests
 
 ```sh
-python3 -m unittest discover -s tests -v     # 190 tests
+python3 -m unittest discover -s tests -v     # 193 tests
 python3 -m krcheat --self-test               # the same checks, in the shipped tool
 ```
 

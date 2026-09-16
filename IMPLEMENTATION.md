@@ -101,7 +101,7 @@ disagreed with.
 ## 4. Verification
 
 ```sh
-python3 -m unittest discover -s tests      # 190 tests
+python3 -m unittest discover -s tests      # 193 tests
 python3 -m krcheat --self-test             # 10 checks, in the shipped tool
 python3 -m krcheat doctor --oracle         # environment + a real VM load
 ```
