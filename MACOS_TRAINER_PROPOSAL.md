@@ -415,8 +415,8 @@ spikes de-risk every uncertain assumption *before* M2 is committed to.
 
 1. **A1 — `love.filesystem` precedence.** Does the save directory shadow the game directory
    for `require` in LÖVE 0.10.1? If yes, Transport B becomes ~20 lines instead of a ZIP
-   repack, and Tier 2 gets even cheaper. (Could not be confirmed offline; the LÖVE wiki is
-   not reachable from this environment.)
+   repack, and Tier 2 gets even cheaper. Expected to hold, but unverified — carried forward as
+   spike S2, which now runs first (foundation §16.1).
 2. **A2 — exact field path for gold/lives.** `player_gold`, `lives`, `lives_left` exist in
    `all/game.lua`, and `all/systems.lua` / `all-desktop/game_gui.lua` reference them, but the
    *global owner* (e.g. `GAME`, `store.game`) must be confirmed at runtime via `probe`.

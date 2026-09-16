@@ -99,6 +99,7 @@ Recorded here so the rest of the document can be read against them. Each is norm
 | D6 | **File-level safety only.** Snapshot per command run, validate, atomic swap, verify after swap, byte-identical restore. Not per-operation backups, no change journal, no bundle rollback. | §15 |
 | D7 | **The CLI is the foundation.** Operations live in `core/`; `cli.py` and `gui/` are thin renderers over the same functions, so a GUI bug cannot diverge from CLI behaviour. | §9.5 |
 | D8 | **File-based logging and configuration.** Append-only JSONL diagnostic log; `config.ini` for user settings and a separate `state.json` for machine-owned cache. | §9.6, §9.7 |
+| D9 | **Slot selection is explicit and never persisted.** `--slot N` is passed per call; within one trainer session the last explicit value is reused; the cache is cleared at every startup, and if no slot has been given the user is **asked**, never guessed at. | §9.7, §10.7 |
 
 ---
 
@@ -752,13 +753,17 @@ failure.
 
 | File | Owner | Contents |
 | --- | --- | --- |
-| `~/.krcheat/config.ini` | user, hand-editable | `[paths]` game/save-dir overrides, default slot; `[ui]` window geometry, last tab, confirm-before-write; `[live]` preferred transport, request timeout; `[logging]` level, retention |
-| `~/.krcheat/state.json` | machine | `version_string` + archive hash, slot inventory, last `doctor` summary, last snapshot id, probed live field paths, mined id sets |
+| `~/.krcheat/config.ini` | user, hand-editable | `[paths]` game/save-dir overrides; `[ui]` window geometry, last tab, confirm-before-write; `[live]` preferred transport, request timeout; `[logging]` level, retention |
+| `~/.krcheat/state.json` | machine | `version_string` + archive hash, **slot inventory** (which slots exist, not which is selected), last `doctor` summary, last snapshot id, probed live field paths, mined id sets |
 
 `configparser` and `json` are both standard library, so the Python 3.9 / no-dependency policy
 holds. TOML is deliberately excluded — `tomllib` is 3.11+ and `tomli` would be a dependency.
 Unknown keys read from `config.ini` are preserved on rewrite. Precedence is
 **CLI flag > config > state > built-in default**.
+
+**One deliberate exception: slot selection is not persisted at all** (D9, §10.7). It appears in
+neither file, so it is absent from that precedence chain by design — a slot is supplied per
+call, reused only within a session, and otherwise asked for.
 
 `state.json` earns its place twice over: cached probe results and mined id sets are keyed on
 `version_string` + archive hash, so repeat runs skip both the S8 oracle load and the constant
@@ -791,7 +796,7 @@ Global options:
 ```
 --game PATH        override app bundle path
 --save-dir PATH    override save directory
---slot N           profile slot (default: see §19 H10 — policy not yet settled)
+--slot N           profile slot; explicit, reused within a session (§10.7)
 --json             machine-readable output
 --dry-run          show what would change, write nothing
 --yes              assume yes for confirmations
@@ -896,6 +901,43 @@ Notes:
   it is removed, not edited, when invalidated.
 * `live status` reports the active transport, so the same information is available when both a
   dylib agent and a patched transport are present.
+
+### 10.7 Slot resolution (D9)
+
+The user may want to modify any slot, so **the slot is never guessed and never persisted.**
+
+Resolution order, applied only by commands that operate on a profile:
+
+1. **`--slot N`, if given.** Always wins, and is recorded as the session's slot.
+2. **The session's slot**, if one was set earlier in the same session — a `krcheat gui` run, or
+   a `live watch` prompt loop. This is what makes passing `--slot` once per call bearable inside
+   a longer session.
+3. **Ask explicitly.** With no `--slot` and no session value, the CLI prompts, listing the slots
+   found on disk (`find_slots()`), and requires an answer. It does **not** fall back to the
+   highest number or the newest mtime: with several profiles in play, a wrong guess edits the
+   wrong save.
+4. **Non-interactive with no slot → usage error, exit 1**, naming `--slot`. A prompt must never
+   hang a script or a pipe.
+
+**The session cache is in memory and is cleared at every trainer startup.** Nothing about slot
+selection is written to `state.json` or `config.ini`, so a new `krcheat` invocation begins with
+no slot and either receives `--slot` or asks. The consequence is deliberate: a stale slot can
+never silently apply an edit to the wrong profile, which is the failure mode that matters here.
+
+Naming a slot that does not exist is **exit 2**, never a silent create — §5.1 records that the
+game itself refuses to make a non-existent slot active, and we mirror that.
+
+**Commands that do not need a slot never resolve one**, and therefore never prompt:
+
+| Command family | Why no slot is needed |
+| --- | --- |
+| `doctor` | reports on every slot found |
+| `backup list` / `restore <id>` | the snapshot records its own source path |
+| `config *`, `log *` | tool configuration and diagnostics are slot-independent |
+| `data *` | F15 overrides are game-wide, not per-slot |
+| `live *` | the channel addresses the running game, and uses whichever slot it already loaded |
+
+This keeps the prompt out of every path that does not genuinely need an answer.
 
 ---
 
@@ -1122,7 +1164,7 @@ of D1, verified rather than assumed.
 | `krcheat/core/log.py` | append-only JSONL diagnostic log, rotation, pruning (§9.6) | `configure(**opts)`, `get_logger(name)` |
 | `krcheat/core/config.py` | `config.ini` read/write with unknown-key preservation (§9.7) | `load() -> Config`, `Config.set(key, value)`, `path()` |
 | `krcheat/core/state.py` | machine-owned `state.json` cache, keyed on `version_string` + archive hash (§9.7) | `load()`, `put(key, value)`, `invalidate()` |
-| `krcheat/core/paths.py` | locate app bundle, `game.love`, save dir, slots, running process, Steam userdata | `AppBundle`, `SaveDir`, `find_slots()`, `is_running()` |
+| `krcheat/core/paths.py` | locate app bundle, `game.love`, save dir, slots, running process, Steam userdata; **slot resolution and prompting (§10.7, D9)** | `AppBundle`, `SaveDir`, `find_slots()`, `resolve_slot(explicit=None, session=None) -> int`, `is_running()` |
 | `krcheat/core/live/protocol.py` | request/response dataclasses, channel paths, framing, atomic handoff (§11.2–11.3) | `Request`, `Response`, `ChannelDirs` |
 | `krcheat/core/live/snippets.py` | parameterised Lua templates, no user-supplied control flow (§11.6) | `gold_inf(n)`, `lives_inf(n)`, `probe()`, `eval(code)` |
 | `krcheat/core/live/transport_dylib.py` | build/locate agent, launch with `DYLD_INSERT_LIBRARIES`, channel loop | `DylibTransport` |
@@ -1367,7 +1409,6 @@ that should already be stable.
 | Python 3.9 floor constrains syntax | certain | low | encode the constraint in `pyproject.toml` and CI |
 | Field names differ from the bytecode constants (locals vs fields) | medium | low | runtime discovery, not static assumptions |
 | Overflowing/clamped values rejected by the game | medium | low | range checks + warnings; re-read after write |
-| Terminal tooling unavailable during automation | observed | low | the tool has no runtime dependency on interactive tooling |
 
 ---
 
@@ -1375,8 +1416,7 @@ that should already be stable.
 
 **H1 — save-directory `require` precedence (LÖVE 0.10.1).** Whether a Lua source file placed in
 `~/Library/Application Support/kingdom_rush/` shadows the same-named module inside `game.love`
-for `require`. This could not be resolved offline (the LÖVE wiki returns HTTP 403 to this
-environment, and the upstream 0.10.1 `Filesystem.cpp` blob could not be extracted in full).
+for `require`. This could not be resolved from the shipped artefacts alone.
 
 **Expectation: yes.** LÖVE 0.10.1 mounts the save directory on top of the game source inside
 `love.filesystem.setIdentity`, and PhysFS resolves from the most recently mounted archive first;
@@ -1434,14 +1474,16 @@ failure is unambiguous.
 **H9 — achievement propagation.** Whether flags written into the save propagate to Steam
 achievements on the next sync, or only change the in-game state.
 
-**H10 — the default-slot policy (open, introduced by this review).** `--slot N` exists, and
-`doctor`/`backup` are slot-aware, but nothing defines what "the active slot" means. §5.1
-references an `active_slot_idx` and the error string *"slot %s must exist before setting it as
-active"*, which implies it is persisted — but the measured `global.lua` (§5.6) does not contain
-it, so its source of truth is unverified. Three candidates, all defensible: highest-numbered
-slot, newest mtime, or a value read from `global.lua`. Resolve before M1, since the default
-affects every tier-1 command; the answer determines whether `paths.find_slots()` needs to read
-game state at all.
+**H10 — the default-slot policy. Closed by D9.** The question was what "the active slot" means,
+given that `--slot N` exists but nothing defined the fallback; §5.1 references an
+`active_slot_idx` and the error string *"slot %s must exist before setting it as active"*, so the
+game does persist an active slot somewhere — but the measured `global.lua` (§5.6) does not
+contain it. Resolution: **we do not read it, and we do not infer one.** The slot is passed per
+call, reused only within a session, and otherwise asked for explicitly (§10.7). That removes the
+dependency on an unverified field entirely, and removes the possibility of editing the wrong
+profile because the game happened to have a different slot active. Reading
+`active_slot_idx` remains available as a future convenience, but it is not on the critical path
+and `paths.find_slots()` therefore needs no game state.
 
 **H11 — whether a shadow module must be removed on version change.** §9.8 removes F15 shadow
 modules automatically when `version_string` changes, on the assumption that the shadowed
