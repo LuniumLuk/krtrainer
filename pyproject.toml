@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "krcheat"
+version = "0.1.0"
+description = "Command-line trainer and save editor for Kingdom Rush on macOS"
+readme = "README.md"
+# Python 3.9 is the measured interpreter on the reference machine (foundation §7.4).
+# No runtime dependencies: the standard library only, for all tiers and both front-ends (§13).
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+krcheat = "krcheat.cli:main"
+krtrainer = "krcheat.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["krcheat*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
