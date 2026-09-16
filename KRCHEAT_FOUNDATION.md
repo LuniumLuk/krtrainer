@@ -115,7 +115,7 @@ text has been amended where it did, and the finding is named here so the change 
 | D13 | **Capture and restore never round-trip through JSON.** The captured originals are kept as Lua references in `__krcheat_saved`, keyed by override key; the capture's *report* is JSON, but the restore path requires no `lib/json` and no decoding. Restoration is what runs when a user turns a cheat off or the heartbeat expires, so it must not be able to fail for an encoding reason, and a table-valued field (`game_outcome`) cannot be restored through JSON at all. | §11.4, §11.7 |
 | D14 | **The response is deleted, not overwritten, when a request is written, and request ids are strictly increasing.** A caller that asks twice must not be able to read the first answer as the answer to the second question. Both halves are required: the id distinguishes responses, and the delete guarantees at most one is ever readable. This was a live bug — with ids that repeated, every `live` command reported the previous command's result. | §11.3 |
 | D15 | **The agent's change detector uses a nanosecond timestamp.** A seconds-resolution `mtime` plus a size is not a change detector: two requests written in the same second with equal-length bodies are indistinguishable, so the second is never read and the caller times out. That is reachable in ordinary use (`live status` twice in a row). | §11.3 |
-| D16 | **Transport A reaches the functions it interposes with plain direct calls, never `dlsym`.** Measured on dyld 4 from an inserted library: `dlsym(RTLD_NEXT, …)` returns NULL (an inserted image is first in load order, so there is nothing "next"), `dlsym(RTLD_DEFAULT, …)` and `dlsym(handle_of_the_defining_framework, …)` both return *the interposer*. The documented rule that makes this work is that an interposing image is not interposed, so its own direct reference is the original. | §9.3, §11.1 |
+| D16 | **Transport A calls the interposed originals directly, with per-thread guards and an explicit resolver as the fallback.** `dlsym` cannot reach an interposed function from an inserted library: measured on dyld 4, `RTLD_NEXT` returns NULL (an inserted image is first in the load order, so there is nothing "next"), while `RTLD_DEFAULT` and even a handle lookup on the defining framework return *the interposer*. A direct call works, because an interposing image is not interposed — but that is not the whole answer. The first version guarded the direct call with a single global flag, which made two threads' concurrent `luaL_newstate` calls look like recursion to each other and returned NULL from one of them; the game dereferenced that NULL state and **crashed**. The guards are now thread-local and per function, they never withhold a result, and a Mach-O symbol-table lookup resolves the original when a call genuinely is routed back. | §9.3, §11.1, §11.6 |
 | D17 | **Transport B's bootstrap shadows `main_globals.lua`.** Verified from the shipped bytecode: it is 119 bytes whose entire constant pool is `KR_PLATFORM`/`KR_TARGET`/`KR_GAME`, and `main.lua` loads it by name. A replacement therefore has an exact contract — return those constants and add nothing — and `install --check` makes the *game* answer the S2 question (whether the save directory's copy wins) instead of the tool assuming it. | §3.3, §9.3, §16.1 |
 
 ---
@@ -1076,6 +1076,12 @@ owns that).
 
 * Re-entrancy guard (never evaluate while a snippet is running, including from the hook). The
   guard must also survive a snippet that itself calls back into the hook.
+* **The agent must be thread-safe, because the host is.** LÖVE creates a `lua_State` per
+  `love.thread` worker, on that worker's thread, so concurrent `luaL_newstate` calls are ordinary
+  startup. A guard that is a single global flag turns that concurrency into apparent recursion, and
+  a guard whose response is to return NULL hands the host a NULL state to dereference — which is a
+  crash, not a degradation. Every guard in the agent is therefore thread-local, per function, and
+  never withholds a result (D16).
 * Size cap on `cmd.json` (e.g. 64 KiB) **and** on `out.json` (§11.3).
 * All agent I/O wrapped so a failure cannot take down the game: on error, log and continue.
 * The agent never blocks the main thread: it reads/writes files, never waits.

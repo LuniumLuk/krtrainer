@@ -36,6 +36,7 @@ Global flags go before the subcommand, but `--slot 2` works after it too.
 | `krcheat --slot 1 profile list achievements` | the known ids: `achievements heroes levels upgrades counters` |
 | `krcheat backup list` | snapshots, newest first |
 | `krcheat log tail --lines 40` | the last diagnostic records |
+| `krcheat config get logging.level` | one setting (`config list` shows them all) |
 
 Nothing above prompts for a slot *except* the `set` commands and `list counters` — `doctor`,
 `backup`, `log`, `config` and `data` are slot-independent.
@@ -87,6 +88,7 @@ krcheat backup restore latest                   # byte-identical, hash-verified
 krcheat backup restore 20260916-213652          # or a unique id prefix, copied from the list
 krcheat backup restore latest --verify-only     # check the hashes, write nothing
 krcheat backup prune --keep 20                  # snapshots are ~7 KB; nothing is auto-deleted
+krcheat log prune                               # apply the log retention policy now
 ```
 
 ---
@@ -101,14 +103,17 @@ krcheat data set level 1 starting_gold 9999              # also: starting_lives
 krcheat data revert --all                                # or --level 1
 ```
 
+`krcheat data set wave …` is refused on purpose: the wave shape has not been measured, and a
+wrong guess would write a module the game loads and misreads.
+
 ---
 
 ## Tier 2 — the live channel
 
-Tier 2 changes the *running* game. It needs the game to be started by krcheat, because the agent
-is a dylib: a dylib has to be in the environment at launch, and there is no way to add one
-afterwards. (That is why `live gold` says "quit the game and use `krcheat play`" when it finds a
-game running without an agent.)
+Tier 2 changes the *running* game. It needs the game to be started by krcheat, because the agent is
+a dylib: a dylib has to be in the environment at launch, and there is no way to add one afterwards.
+(That is why `live gold` says "quit the game and use `krcheat play`" when it finds a game running
+without an agent.)
 
 ```sh
 krcheat play                            # launches the game with the agent; from Steam will not do
@@ -117,13 +122,27 @@ krcheat live probe                      # dump the game's globals — the step t
 krcheat live gold infinity              # 99999, re-applied every frame
 krcheat live gold 5000                  # written once; the game keeps spending from it
 krcheat live gold off                   # release it AND restore the value captured at registration
-krcheat live lives infinity
-krcheat live speed 3
-krcheat live god on
+krcheat live lives infinity             # lives takes the same three forms
+krcheat live speed 3                    # per-frame multiplier
+krcheat live god on                     # stop the life counter from ending the level
 krcheat live eval "return store.game.player_gold"
 krcheat live watch                      # interactive Lua prompt, Ctrl-D to leave
 krcheat live off                        # release everything at once
 ```
+
+`<n>`, `infinity` and `off` mean the same three things for `gold` and `lives`: write once, hold it
+every frame, or release and restore. `speed` and `god` take a value and `off`.
+
+**`probe` first.** Field names are discovered, not guessed: `probe` enumerates the globals, and the
+owner chain it reports is what the snippets are generated from. `god` and `speed` use two sentinels
+that come from the shipped debug strings rather than from a running game, so they are the two worth
+checking with `probe` (`live god on` then `live status` is enough to see whether it took).
+
+**Loops are refused, on purpose.** `live eval` and `live watch` are `once`-only, and a per-frame
+snippet containing `while` / `for` / `repeat` / `goto` / `::` is rejected *before* it is sent. A loop
+in the game's main thread cannot be undone through the channel, because the code that would read the
+fix is the code that is hanging. The agent additionally runs every snippet under an instruction
+watchdog, which kills a runaway loop in about a third of a second.
 
 **An override lives as long as a process asks for it.** The agent clears every override when its
 heartbeat goes stale (10 s by default), so a crashed CLI cannot leave your game modified. Two
@@ -131,16 +150,18 @@ consequences:
 
 * `krcheat live gold infinity` and then exiting releases the cheat — that is the safe default;
 * `--keep` leaves a small background keeper holding the heartbeat, so `play` + `gold infinity
-  --keep` + exit leaves it running while you play.
+  --keep` + exit leaves it running while you play. It works on all four overrides.
 
 ```sh
 krcheat live gold infinity --keep        # survives this command
+krcheat live status                      # shows that a keeper is holding it
 krcheat live status --stop-keeper        # ...until you stop it
+krcheat live off                         # stops the keeper and restores everything
 ```
 
-**Only the dylib transport is wired to a running session** (`--transport dylib`, the default).
-Transport B installs; whether the game honours a file in the save directory is spike S2, and the
-game answers it:
+**Transports.** `--transport dylib|patched|frida` picks the mechanism. Only `dylib` (the default) is
+wired to a running session. Transport B installs; whether the game honours a file in the save
+directory is spike S2, and the game answers it:
 
 ```sh
 krcheat install                          # write the bootstrap; then launch the game once
@@ -151,8 +172,10 @@ krcheat agent status                     # where the dylib is, and whether it is
 krcheat agent build --force              # rebuild it (it is built on demand otherwise)
 ```
 
-If S2 fails, transport B would need the ZIP-repack variant and `install --check` says so. The
-dylib transport needs none of this — it modifies nothing in the game installation.
+If S2 fails, transport B would need the ZIP-repack variant and `install --check` says so. The dylib
+transport needs none of this — it modifies nothing in the game installation.
+
+Everything above takes `--json` as well, which is the same information as data rather than prose.
 
 ---
 

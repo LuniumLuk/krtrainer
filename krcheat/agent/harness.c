@@ -21,6 +21,7 @@
 #include "kr_agent.h"
 
 #include <dlfcn.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -49,6 +50,46 @@ extern const char *SDL_GetError(void);
 extern void SDL_GL_SwapWindow(void *window);
 
 #define MAX_REPORTS 8
+
+/*
+ * Concurrent state creation, the way LÖVE does it.
+ *
+ * `love.thread` gives each worker its own `lua_State`, and it creates them on those threads. So
+ * "two threads call luaL_newstate at the same time" is not a hypothetical: it is startup, and it
+ * is how the agent broke the game once already. A guard that is a plain global `int` mistakes one
+ * thread's call for its own recursion, and if the guard's response is to return NULL then the
+ * host dereferences a NULL state and dies.
+ *
+ * `--threads N` reproduces it here, where the worst case is a failed test rather than a crash in
+ * somebody's game.
+ */
+typedef struct {
+    int index;
+    int ok;
+} thread_job;
+
+static int noop(lua_State *L)
+{
+    (void)L;
+    return 0;
+}
+
+static void *make_state_on_a_thread(void *argument)
+{
+    thread_job *job = (thread_job *)argument;
+    lua_State *L = luaL_newstate();
+    if (!L) {
+        /* Exactly what LÖVE did to die: it took the NULL and used it. Nothing is dereferenced
+         * here — the count is the signal, and a SIGSEGV in a test is a worse way to learn this
+         * than a number. */
+        return NULL;
+    }
+    lua_pushcclosure(L, noop, 0); /* this is the frame the real crash died in */
+    lua_settop(L, 0);
+    lua_close(L);
+    job->ok = 1;
+    return NULL;
+}
 
 static int run_chunk(lua_State *L, const char *code, const char *name, char **out)
 {
@@ -134,6 +175,7 @@ int main(int argc, char **argv)
     const char *reports[MAX_REPORTS];
     int report_count = 0;
     int use_sdl = 1;
+    int thread_count = 0;
     double seconds = 6.0;
     double ticks_per_second = 240.0;
     double interval;
@@ -149,6 +191,12 @@ int main(int argc, char **argv)
             probe_dylib = argv[++i];
         } else if (strcmp(argv[i], "--no-sdl") == 0) {
             use_sdl = 0;
+        } else if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
+            thread_count = atoi(argv[++i]);
+            if (thread_count < 0 || thread_count > 64) {
+                fprintf(stderr, "harness: --threads must be between 0 and 64\n");
+                return 2;
+            }
         } else if (strcmp(argv[i], "--seconds") == 0 && i + 1 < argc) {
             seconds = atof(argv[++i]);
         } else if (strcmp(argv[i], "--ticks-per-second") == 0 && i + 1 < argc) {
@@ -216,6 +264,37 @@ int main(int argc, char **argv)
 
     printf("HARNESS pid=%d capture=%s channel=%s\n", (int)getpid(), capture, kr_agent_channel_dir());
     fflush(stdout);
+
+    /*
+     * Concurrent state creation, before the frame loop. If the agent confuses two threads'
+     * calls for its own recursion, this is where it shows — as a NULL count rather than as a
+     * dead game.
+     */
+    if (thread_count > 0) {
+        pthread_t threads[64];
+        thread_job jobs[64];
+        int started = 0;
+        int nulls = 0;
+        for (i = 0; i < thread_count; i++) {
+            jobs[i].index = i;
+            jobs[i].ok = 0;
+            if (pthread_create(&threads[i], NULL, make_state_on_a_thread, &jobs[i]) == 0) {
+                started++;
+            } else {
+                jobs[i].ok = -1;
+            }
+        }
+        for (i = 0; i < started; i++) {
+            pthread_join(threads[i], NULL);
+        }
+        for (i = 0; i < thread_count; i++) {
+            if (jobs[i].ok == 0) {
+                nulls++;
+            }
+        }
+        printf("HARNESS threads=%d started=%d nulls=%d\n", thread_count, started, nulls);
+        fflush(stdout);
+    }
 
     /*
      * Prefer a real frame path: SDL_GL_SwapWindow is how the game presents, and calling it is

@@ -43,3 +43,6 @@ game.love
 slot_*.lua
 settings.lua
 global.lua
+
+# VS Code writes these wherever a task is created from; only the root one is shared.
+**/.vscode/*

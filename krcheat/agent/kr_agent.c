@@ -29,6 +29,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <mach-o/dyld.h>
+#include <mach-o/loader.h>
+#include <mach-o/nlist.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -193,35 +195,172 @@ static void kr_buf_json_string(kr_buf *b, const char *s, size_t n)
 /*
  * How does the replacement call the function it replaced?
  *
- * Not with `dlsym`, which is the textbook answer and does not work here. Measured on macOS
- * 15.7 / dyld 4, from a library injected with DYLD_INSERT_LIBRARIES:
+ * Two mistakes were made here before this comment was written, and both crashed the game, so the
+ * reasoning is recorded rather than the conclusion alone.
+ *
+ * **Mistake 1: `dlsym`.** Measured on dyld 4 from a library injected with
+ * DYLD_INSERT_LIBRARIES:
  *
  *   dlsym(RTLD_NEXT, "luaL_newstate")        -> NULL   (nothing "next" to us: inserted images
  *                                                        are first in the load order)
  *   dlsym(RTLD_DEFAULT, "luaL_newstate")     -> us     (a flat lookup applies interposition)
- *   dlsym(handle_of_Lua_framework, ...)      -> us     (interposition applies to handle
- *                                                        lookups too, so the real definition
- *                                                        is unreachable this way)
+ *   dlsym(handle_of_Lua_framework, ...)      -> us     (interposition applies to handle lookups
+ *                                                        too)
  *
- * The documented rule that resolves this is that *an interposing image is not interposed*:
- * dyld deliberately leaves a library's own references to the symbols it interposes alone,
- * which is exactly so that a replacement can call the original. So a plain direct call from
- * this file reaches the real function, and there is nothing to resolve at all.
+ * So a direct call does the work: dyld does not interpose an interposing image's own references,
+ * and that is the documented mechanism that lets a replacement call the original. It is what
+ * `kr_call_*` below do, and it is verified in the harness *and* in the real game (frames ticked
+ * through the interposed present).
  *
- * The lesson generalises: this was worth measuring rather than assuming, because the failure
- * mode of guessing wrong here is a game that will not start (a NULL Lua state) or a window
- * that never presents.
+ * **Mistake 2: a single global recursion flag.** That flag was an `int`, shared by every thread.
+ * LÖVE creates Lua states on `love.thread` worker threads, so two threads calling
+ * `luaL_newstate` at the same time each saw the other's flag and each concluded it had recursed
+ * itself. The guard "gave up" — by returning NULL — and the game then dereferenced a NULL
+ * `lua_State`, registering `EXC_BAD_ACCESS at 0x10` inside `lua_pushcclosure` on a thread runner.
+ * A crash in the user's game is the worst thing this project can do, and it came from a guard
+ * that was meant to be a safety net.
+ *
+ * Hence the rules now:
+ *
+ *   1. the depth counter is **thread-local and per function** (`__thread`), so concurrency is
+ *      never mistaken for recursion — and so that `luaL_newstate` legitimately reaching
+ *      `lua_newstate` inside Lua.framework is not mistaken for it either;
+ *   2. the guard is a **tripwire, not a policy**: it logs, and then still calls the original.
+ *      "Give up" is not an option here, because the caller has no way to cope with a NULL state;
+ *   3. the original is resolved explicitly as a last resort (`kr_resolve_symbol`), so that even a
+ *      genuine routing-back has an answer that is not NULL.
  */
+
+/* Primary path: the direct call. A replacement may call the original by name because dyld does
+ * not interpose a library's references to the symbols it interposes. */
+extern lua_State *luaL_newstate(void);
+extern lua_State *lua_newstate(lua_Alloc f, void *ud);
+extern void SDL_GL_SwapWindow(void *window);
+
+static __thread int t_depth_luaL_newstate = 0;
+static __thread int t_depth_lua_newstate = 0;
+static __thread int t_depth_swap_window = 0;
+
+/* Counted, not just logged, so `kr_agent_status_text` can report it: a non-zero value means a call
+ * really was routed back to us, which is the condition the resolver exists for. */
+static int g_reentry_reports = 0;
+
+/* One-shot diagnostics for the tripwires. A benign race on a flag that only decides whether a log
+ * line is written is preferable to a mutex in a path that must stay cheap. */
+static int g_reported_luaL_newstate = 0;
+static int g_reported_lua_newstate = 0;
+static int g_reported_swap_window = 0;
+
+static void *kr_resolve_symbol(const char *symbol, const char *preferred_image, const void *ours);
+
+/* ------------------------------------------------------------------- symbol resolution */
+
+/*
+ * The last-resort way to find a function's real address: read the Mach-O symbol table of the
+ * image that defines it and add the slide. This bypasses dyld's interposition entirely, because
+ * nothing here goes through a binding — it is the file's own table plus the address dyld chose
+ * for the image.
+ *
+ * It is the fallback rather than the primary path because it is the most code and the most
+ * assumptions: it wants an unstripped `LC_SYMTAB`, which the shipped `Lua.framework` has
+ * (verified with `nm -gU`: 87 `lua_*` symbols). It exists so that a genuine routing-back has an
+ * answer that is not NULL, which is the only answer the caller cannot survive.
+ */
+static void *kr_symbol_in_image(const struct mach_header_64 *header, intptr_t slide,
+                                const char *symbol)
+{
+    const struct load_command *command;
+    const struct symtab_command *symtab = NULL;
+    const struct nlist_64 *symbols;
+    const char *strings;
+    uint32_t index;
+
+    if (!header || header->magic != MH_MAGIC_64) {
+        return NULL;
+    }
+    command = (const struct load_command *)((const char *)header + sizeof(struct mach_header_64));
+    for (index = 0; index < header->ncmds; index++) {
+        if (command->cmd == LC_SYMTAB) {
+            symtab = (const struct symtab_command *)command;
+            break;
+        }
+        if (command->cmdsize == 0) {
+            return NULL;
+        }
+        command = (const struct load_command *)((const char *)command + command->cmdsize);
+    }
+    if (!symtab || symtab->nsyms == 0) {
+        return NULL;
+    }
+    symbols = (const struct nlist_64 *)((const char *)header + symtab->symoff);
+    strings = (const char *)header + symtab->stroff;
+    for (index = 0; index < symtab->nsyms; index++) {
+        const struct nlist_64 *entry = &symbols[index];
+        if ((entry->n_type & N_STAB) != 0 || (entry->n_type & N_TYPE) != N_SECT) {
+            continue;
+        }
+        if (entry->n_un.n_strx == 0 || entry->n_un.n_strx >= symtab->strsize) {
+            continue;
+        }
+        if (strcmp(strings + entry->n_un.n_strx, symbol) == 0) {
+            return (void *)(slide + (intptr_t)entry->n_value);
+        }
+    }
+    return NULL;
+}
+
+static void *kr_resolve_symbol(const char *symbol, const char *preferred_image, const void *ours)
+{
+    uint32_t count = _dyld_image_count();
+    int pass;
+
+    /* Pass 1 looks only at the library that should define it; pass 2 at everything else, in
+     * case Lua is linked into the game some other way than the frameworks suggest. */
+    for (pass = 0; pass < 2; pass++) {
+        uint32_t index;
+        for (index = 0; index < count; index++) {
+            const char *name = _dyld_get_image_name(index);
+            const struct mach_header *header = _dyld_get_image_header(index);
+            void *found;
+
+            if (!name || !header) {
+                continue;
+            }
+            /* Never ourselves, and never a second copy of ourselves. */
+            if (strstr(name, "kr_agent")) {
+                continue;
+            }
+            if (pass == 0 && (!preferred_image || !strstr(name, preferred_image))) {
+                continue;
+            }
+            found = kr_symbol_in_image((const struct mach_header_64 *)header,
+                                       _dyld_get_image_vmaddr_slide(index), symbol);
+            if (found && found != ours) {
+                return found;
+            }
+        }
+    }
+
+    /* Pass 3: the documented lookups, rejected if they hand back our own replacement. */
+    {
+        void *found = dlsym(RTLD_NEXT, symbol);
+        if (found && found != ours) {
+            return found;
+        }
+        found = dlsym(RTLD_DEFAULT, symbol);
+        if (found && found != ours) {
+            return found;
+        }
+    }
+    return NULL;
+}
 
 static lua_State *g_L = NULL;
 static int g_attached = 0;
-static int g_in_swap = 0;
-static int g_reentry_reports = 0;
 static unsigned long g_frames_hooked = 0;
-static int g_in_newstate = 0;
 static pthread_mutex_t g_reentry = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_attach_lock = PTHREAD_MUTEX_INITIALIZER;
 static unsigned long g_frame = 0;
-
 static char g_channel[768];
 static char g_cmd_path[820];
 static char g_out_path[820];
@@ -239,6 +378,17 @@ static time_t g_attached_at = 0;
 
 /* Defined with the interposers, below, but needed by kr_agent_attach. */
 static int kr_ensure_channel(void);
+
+/*
+ * Report whether the last-resort symbol lookup works, once, at attach.
+ *
+ * The fallback only runs if a call is ever routed back to us, so without this it would be code
+ * that has never executed on the machine where it matters most — and it is the difference between
+ * a recovered call and a NULL `lua_State`, which is fatal for the host. Checking it here costs
+ * three symbol lookups per attach, exercises the resolver on every real run, and means a stripped
+ * or renamed symbol is visible in the log *before* anything needs it.
+ */
+static void kr_log_fallback_check(void);
 
 static void kr_log(const char *fmt, ...)
 {
@@ -1208,12 +1358,21 @@ int kr_agent_attach(lua_State *L)
     if (!L || g_attached) {
         return 0;
     }
+    /* LÖVE creates states on worker threads, so this can be reached concurrently. The mutex
+     * makes "first one wins" true rather than probable; anything else would attach the agent to
+     * a state that is about to be handed to a thread and then read frames on another. */
+    pthread_mutex_lock(&g_attach_lock);
+    if (g_attached) {
+        pthread_mutex_unlock(&g_attach_lock);
+        return 0;
+    }
     g_L = L;
     g_attached = 1;
 
     if (kr_ensure_channel() != 0) {
         /* No channel, no agent: log nowhere and stay out of the way. */
         g_log_path[0] = '\0';
+        pthread_mutex_unlock(&g_attach_lock);
         return -1;
     }
     g_hb_last_touch = kr_now();
@@ -1221,6 +1380,8 @@ int kr_agent_attach(lua_State *L)
     lua_sethook(L, NULL, 0, 0); /* make sure no stale hook from a previous attach survives */
     kr_log("[krcheat] agent %s attached: pid=%d, state=%p, channel=%s",
            KR_AGENT_VERSION, (int)getpid(), (void *)L, g_channel);
+    kr_log_fallback_check();
+    pthread_mutex_unlock(&g_attach_lock);
     return 0;
 }
 
@@ -1257,45 +1418,68 @@ void kr_agent_shutdown(void)
 
 /* --------------------------------------------------------------- the interposers */
 
-/* Resolved from SDL2.framework by dyld; only its address in the interpose table is needed. */
-extern void SDL_GL_SwapWindow(void *window);
+/*
+ * Every interposer here has the same shape, and the shape is the point:
+ *
+ *   - the depth counter is `__thread` and belongs to *one* function, so concurrent calls from
+ *     different threads are ordinary calls, and `luaL_newstate` reaching `lua_newstate` inside
+ *     Lua.framework is ordinary nesting;
+ *   - the tripwire logs and then still calls the original. It never withholds the result,
+ *     because the caller cannot survive a NULL `lua_State` — see the note above.
+ */
 
-/* The frame hook. Our part runs before the present so an `always` snippet takes effect in
- * the frame it was registered for; the original present is still called, always. */
+/* The frame hook. Our part runs before the present so an `always` snippet takes effect in the
+ * frame it was registered for; the original present is still called, always. */
 static void kr_swap_window(void *window)
 {
-    /*
-     * The re-entry guard matters more here than anywhere else. If this call were ever routed
-     * back to us, the alternative is a stack overflow inside the game's frame loop; returning
-     * without presenting is a visibly frozen window, which is bad but recoverable (the user
-     * quits the game). Measured behaviour is that the direct call reaches the real function.
-     */
-    if (g_in_swap) {
-        if (g_reentry_reports < 10) {
-            g_reentry_reports++;
-            kr_log("[krcheat] SDL_GL_SwapWindow re-entered; skipping the frame");
+    if (t_depth_swap_window++ > 0) {
+        /* Genuine routing-back: the frame must still be presented, so resolve the original
+         * rather than returning (a window that never presents looks like a frozen game). */
+        void (*real)(void *) =
+            (void (*)(void *))kr_resolve_symbol("_SDL_GL_SwapWindow", "SDL2", (const void *)kr_swap_window);
+        t_depth_swap_window--;
+        if (!g_reported_swap_window) {
+            g_reported_swap_window = 1;
+            kr_log("[krcheat] SDL_GL_SwapWindow was routed back to us; using the resolved "
+                   "original (%s)", real ? "found" : "NOT FOUND");
+        }
+        g_reentry_reports++;
+        if (real) {
+            real(window);
+            return;
         }
         return;
     }
-    g_in_swap = 1;
     g_frames_hooked++;
     kr_agent_tick();
     SDL_GL_SwapWindow(window);
-    g_in_swap = 0;
+    t_depth_swap_window--;
 }
 
 static lua_State *kr_newstate(void)
 {
     lua_State *L;
-    /* Recursion guard: if the direct call below is somehow routed back to us, return NULL
-     * once and log, rather than recursing until the stack dies. */
-    if (g_in_newstate) {
-        kr_log("[krcheat] re-entered luaL_newstate; giving up");
-        return NULL;
+    lua_State *(*real)(void);
+
+    if (t_depth_luaL_newstate++ > 0) {
+        real = (lua_State * (*)(void)) kr_resolve_symbol("_luaL_newstate", "Lua.framework",
+                                                        (const void *)kr_newstate);
+        t_depth_luaL_newstate--;
+        if (!g_reported_luaL_newstate) {
+            g_reported_luaL_newstate = 1;
+            kr_log("[krcheat] luaL_newstate was routed back to us; using the resolved original "
+                   "(%s)", real ? "found" : "NOT FOUND");
+        }
+        g_reentry_reports++;
+        if (!real) {
+            kr_log("[krcheat] luaL_newstate recursed and the original could not be found");
+            return NULL; /* unreachable in practice; reported loudly if ever reached */
+        }
+        L = real();
+    } else {
+        L = luaL_newstate();
+        t_depth_luaL_newstate--;
     }
-    g_in_newstate = 1;
-    L = luaL_newstate();
-    g_in_newstate = 0;
     if (L && !g_attached) {
         kr_agent_attach(L);
     }
@@ -1305,17 +1489,54 @@ static lua_State *kr_newstate(void)
 static lua_State *kr_newstate_with_alloc(lua_Alloc alloc, void *ud)
 {
     lua_State *L;
-    if (g_in_newstate) {
-        kr_log("[krcheat] re-entered lua_newstate; giving up");
-        return NULL;
+    lua_State *(*real)(lua_Alloc, void *);
+
+    if (t_depth_lua_newstate++ > 0) {
+        real = (lua_State * (*)(lua_Alloc, void *)) kr_resolve_symbol(
+            "_lua_newstate", "Lua.framework", (const void *)kr_newstate_with_alloc);
+        t_depth_lua_newstate--;
+        if (!g_reported_lua_newstate) {
+            g_reported_lua_newstate = 1;
+            kr_log("[krcheat] lua_newstate was routed back to us; using the resolved original "
+                   "(%s)", real ? "found" : "NOT FOUND");
+        }
+        g_reentry_reports++;
+        if (!real) {
+            kr_log("[krcheat] lua_newstate recursed and the original could not be found");
+            return NULL; /* unreachable in practice; reported loudly if ever reached */
+        }
+        L = real(alloc, ud);
+    } else {
+        L = lua_newstate(alloc, ud);
+        t_depth_lua_newstate--;
     }
-    g_in_newstate = 1;
-    L = lua_newstate(alloc, ud);
-    g_in_newstate = 0;
     if (L && !g_attached) {
         kr_agent_attach(L);
     }
     return L;
+}
+
+/*
+ * Report whether the last-resort symbol lookup works, once, at attach.
+ *
+ * The fallback only runs if a call is ever routed back to us, so without this it would be code
+ * that has never executed on the machine where it matters most — and it is the difference between
+ * a recovered call and a NULL `lua_State`, which is fatal for the host. Checking it here costs
+ * three symbol lookups per attach, exercises the resolver on every real run, and means a stripped
+ * or renamed symbol shows up in the log *before* anything needs it.
+ */
+static void kr_log_fallback_check(void)
+{
+    void *newstate = kr_resolve_symbol("_luaL_newstate", "Lua.framework", (const void *)kr_newstate);
+    void *newstate_alloc = kr_resolve_symbol("_lua_newstate", "Lua.framework",
+                                            (const void *)kr_newstate_with_alloc);
+    void *swap = kr_resolve_symbol("_SDL_GL_SwapWindow", "SDL2", (const void *)kr_swap_window);
+    kr_log("[krcheat] fallback resolution: luaL_newstate=%s lua_newstate=%s swap=%s",
+           newstate ? "yes" : "NO", newstate_alloc ? "yes" : "NO", swap ? "yes" : "NO");
+    if (!newstate || !newstate_alloc || !swap) {
+        kr_log("[krcheat] WARNING: a call routed back to us may not be recoverable on this "
+               "build; its symbols are not where they were expected");
+    }
 }
 
 /*

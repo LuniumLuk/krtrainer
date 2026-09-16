@@ -265,6 +265,48 @@ class TestAgentLoad(unittest.TestCase):
         self.assertGreater(parsed.get("frames", 0), 0)
         self.assertEqual(parsed.get("reentry_skips"), 0)
 
+    def test_concurrent_state_creation_is_not_mistaken_for_recursion(self):
+        """The bug that crashed the game, pinned.
+
+        LÖVE gives each `love.thread` worker its own `lua_State` and creates them on those
+        threads, so concurrent `luaL_newstate` calls are startup, not an edge case. The agent's
+        guard used to be a single global `int`, so two threads each saw the other's flag and each
+        concluded it had recursed *itself* — and the guard's response was to return NULL. The game
+        dereferenced that NULL `lua_State` inside `lua_pushcclosure` on a thread runner and died of
+        `EXC_BAD_ACCESS at 0x10`.
+
+        Two things are asserted, and the second is the one with teeth:
+
+        * `nulls=0` — no call is ever handed a NULL state;
+        * no `routed back to us` line in the agent log — the guards are per-thread, so ordinary
+          concurrency is not reported as recursion at all.
+
+        Measured, not assumed: rebuilding the agent with a shared counter (a one-line change, no
+        tripwire) reproduces the second assertion failing while `nulls=0` still passes. Without
+        that check this test would have verified the symptom instead of the cause.
+        """
+        fixture = _Fixture(WORLD).start(seconds=2, extra=["--threads", "12"])
+        self.addCleanup(fixture.cleanup)
+        fixture.process.wait(timeout=60)
+        output = fixture.output()
+        self.assertIn("HARNESS threads=12 started=12 nulls=0", output)
+        self.assertIn("HARNESS frames=sdl", output)
+
+        log = _read(fixture.channel.log_path)
+        self.assertNotIn(
+            "routed back to us",
+            log,
+            "concurrent state creation was mistaken for recursion:\n{0}".format(log),
+        )
+        # The last-resort lookup is load-bearing when a call *is* routed back, so it must work on
+        # this machine — and the agent reports that once per attach rather than leaving it to
+        # chance.
+        self.assertIn(
+            "fallback resolution: luaL_newstate=yes lua_newstate=yes swap=yes",
+            log,
+            "the agent could not resolve the originals it would need as a fallback:\n{0}".format(log),
+        )
+
 
 class TestBootstrapInRealLua(unittest.TestCase):
     """Transport B's generated module, run by a real LuaJIT with no `love` in it.

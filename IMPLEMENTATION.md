@@ -317,3 +317,36 @@ worked*. Every one of them was invisible to inspection, and every one is now a t
 | 10 | **The cheatsheet and the parser had already drifted** the moment tier 2 landed. | Fixed by a test that checks both directions, plus the pre-existing guard that every sub-action has `help=` text (argparse hides actions without it). |
 | 11 | **`--check` would have declared spike S2 failed whenever it was run before the game had been started.** | "The game ignored our file" and "the game has not run yet" are different answers, and only one of them means the transport has to be rebuilt. Distinguished by comparing the game's own file writes against the install time. |
 | 12 | **The oracle opens no libraries, so a real module cannot run inside it.** | The bootstrap test had to move to the harness: `pcall` itself is missing in the oracle's sandbox. Worth recording, because the next person will reach for the oracle to run something and be puzzled by the error. |
+
+### 8.1 The crash (2026-09-17, after the first commit)
+
+Separated out because it is the only defect in this project that damaged something the user cares
+about, and because the way it was found is the point.
+
+Running the cheatsheet's own commands to verify them, `krcheat play` was one of them — and the
+verifier's naive parser kept the trailing `# comment` on each line, so the invocation it actually
+ran was `krcheat play`, with no sandbox flags. It launched the real game. That accident produced
+the most valuable log this project has: the first real injection, showing the state captured and
+frames ticking — **and**, seconds later, `love` dying of `EXC_BAD_ACCESS at 0x10` inside
+`lua_pushcclosure` on a `love::thread` worker.
+
+What the log and the crash report together showed:
+
+```
+injected into pid=31864, waiting for a lua_State
+attached: state=0x2d4b380                      <- S4 and S5, answered for real
+frame=600 / frame=1200                         <- the present hook works in the real game
+re-entered luaL_newstate; giving up            <- the bug
+```
+
+| # | Finding | Why it mattered |
+| --- | --- | --- |
+| 13 | **The re-entry guard was a global `int`, shared by every thread.** LÖVE creates a `lua_State` per `love.thread` worker on that worker's thread, so two concurrent `luaL_newstate` calls each saw the other's flag and each concluded it had recursed *itself*. | The guard's response was to "give up" by returning NULL. The game dereferenced the NULL `lua_State` and crashed. A guard meant to be a safety net became the cause of the only unrecoverable outcome in the project. |
+| 14 | **Documenting a mechanism is not verifying it.** The direct call *did* work in the harness, and still does — the harness is single-threaded, so it could not see the guard's real failure mode. The conclusion "a direct call is safe" was drawn from an environment that could not falsify it. | The fix has three parts, and each is now tested: per-thread per-function counters (`__thread`), a tripwire that logs and *still* calls the original instead of withholding it, and a Mach-O symbol-table resolver as the fallback for a genuine routing-back. The harness gained `--threads N` so the host's real concurrency is reproduced where a failure costs a red test rather than a dead game. |
+
+**The regression test would not have caught this on its own, and that was checked.** With the
+thread-local counters reverted — a one-line change — `nulls=0` still passes, because the resolver
+recovers the call. What fails is the assertion that the log contains no `routed back to us` line.
+Both measured, not assumed: that is why the test asserts the *cause* and not only the symptom, and
+why the agent reports its fallback resolution once per attach instead of leaving it to luck.
+
