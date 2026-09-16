@@ -85,6 +85,21 @@ Three consequences drive the whole design:
 3. **Field access is by name, not by address**, so the trainer does not break when the game
    updates (a weakness of the original: hard-coded `mono.dll+0x1F2680` chains).
 
+### 2.1 Design decisions (review of 2026-09-16)
+
+Recorded here so the rest of the document can be read against them. Each is normative.
+
+| # | Decision | Sections affected |
+| --- | --- | --- |
+| D1 | **Lossless codec.** The save reader preserves each scalar's original literal text; the writer re-emits untouched bytes verbatim and only renders nodes the tool changed. A command that changes nothing produces a **byte-identical** file. | §12 |
+| D2 | **Mutation preconditions.** Mutating commands refuse to run while the game is running (`--force` overrides). Steam running is a prominent warning gated behind `--yes`, not a refusal. | §15 |
+| D3 | **Spike S2 runs first**, before M1, and its result may re-scope the plan: if save-directory shadowing holds, Transport B collapses to "drop one file" and the bytecode patcher is demoted to the backlog. | §16.1, §17, §19 |
+| D4 | **Spike S8 — the shipped `Lua.framework` is the verification oracle.** Loaded from Python via `ctypes` (stdlib only), it validates generated saves and patched modules against the real VM, and is the authoritative data source for id enumeration. | §13, §14, §16 |
+| D5 | **F15 — persistent per-level data** (starting gold/lives, wave rewards) delivered as shadow data modules. | §8, §10.6 |
+| D6 | **File-level safety only.** Snapshot per command run, validate, atomic swap, verify after swap, byte-identical restore. Not per-operation backups, no change journal, no bundle rollback. | §15 |
+| D7 | **The CLI is the foundation.** Operations live in `core/`; `cli.py` and `gui/` are thin renderers over the same functions, so a GUI bug cannot diverge from CLI behaviour. | §9.5 |
+| D8 | **File-based logging and configuration.** Append-only JSONL diagnostic log; `config.ini` for user settings and a separate `state.json` for machine-owned cache. | §9.6, §9.7 |
+
 ---
 
 ## 3. Target application profile
@@ -491,10 +506,22 @@ candidates in order and log which one succeeded.
 | `codesign` | `/usr/bin/codesign` (for ad-hoc signing the agent dylib) |
 | Xcode CLT | `/Library/Developer/CommandLineTools` |
 | `python3` | `3.9.6` (pyenv shim; also `/usr/bin/python3`) |
+| `tkinter` | **must be verified per-interpreter** — pyenv builds frequently omit `_tkinter` |
 | `frida` | **not installed** (only relevant to the optional transport C) |
 
 `python3 3.9` sets the language floor: the CLI must be **Python 3.9 compatible** (no `match`,
 no `X | Y` type unions at runtime without `from __future__ import annotations`, etc.).
+
+Tk has two macOS-specific constraints that §9.5 must handle, not discover at runtime:
+
+* `_tkinter` is an optional build-time module. `import tkinter` must be attempted behind a
+  guard, and `krcheat gui` must fail with a clear message rather than a traceback.
+* A non-framework Python build (pyenv, some Homebrew builds) produces Tk windows that open
+  behind the terminal and refuse focus. `doctor` reports whether the interpreter is a
+  framework build.
+
+Both are environment properties, so `doctor` reports them; the CLI and tiers 1–3 have no
+dependency on Tk whatsoever.
 
 ---
 
@@ -518,6 +545,8 @@ no `X | Y` type unions at runtime without `from __future__ import annotations`, 
 | F12 | **State probe/discovery** | new | live channel | 2 |
 | F13 | Offline **bytecode patching** (permanent tweaks) | new | `game.love` copy | 3 |
 | F14 | **Backup / restore / doctor** | new | filesystem | 1 |
+| F15 | Persistent per-level data: **starting gold, starting lives, wave rewards** | "Gold"/"Health" as a *persistent* tweak rather than a live write | shadow data module (§9.8) | 1 (depends on S2; falls back to 3) |
+| F16 | **tkinter GUI wrapper** | the WinForms front end itself | `gui/` over `core/` (§9.5) | front-end |
 
 ### 8.2 Acceptance criteria
 
@@ -530,8 +559,14 @@ no `X | Y` type unions at runtime without `from __future__ import annotations`, 
   and the "stars earned" totals on the map reflect it.
 * **F5–F8** — the corresponding UI counters change after restart; the game does not delete the
   slot.
-* **F14** — every mutating command produces a restorable backup, and `krcheat backup restore`
-  returns the file to a byte-identical state.
+* **F14** — every mutating command takes a verified snapshot before its first write, and
+  `krcheat backup restore <id>` returns the file to a byte-identical state (D6).
+* **F15** — with a level-data override applied, the affected level starts with the configured
+  gold/lives; `data revert` restores the shipped values exactly; the game's slot validation
+  still passes. **Requires S2**; if S2 fails, F15 moves to tier 3 and inherits its risks.
+* **F16** — the GUI performs every tier-1 and tier-2 operation the CLI can, through the same
+  `core/` functions; a snapshot is taken and the running-game gate is enforced identically.
+  No operation is GUI-only.
 * **All tier-1 commands** must work with **no** compiler, no root, no injection, and while the
   game is not running.
 
@@ -543,16 +578,26 @@ no `X | Y` type unions at runtime without `from __future__ import annotations`, 
 
 ```mermaid
 flowchart TB
-    CLI["krcheat CLI (Python 3.9+)"]
-    CLI --> CFG["paths.py<br/>discovery"]
-    CLI --> PROF["profile.py<br/>Tier 1"]
-    CLI --> LIVE["live/*<br/>Tier 2"]
-    CLI --> PATCH["patch/*<br/>Tier 3"]
-    CLI --> BK["backup.py"]
+    subgraph CORE["core/ — operations (one implementation)"]
+        PROF["profile.py<br/>Tier 1"]
+        LIVE["live/*<br/>Tier 2"]
+        DATA["data.py<br/>F15 shadow modules"]
+        PATCH["patch/*<br/>Tier 3 (backlog)"]
+        BK["backup.py"]
+    end
 
-    PROF --> CODEC["lua_table.py<br/>read + write"]
+    CLI["cli.py<br/>argparse → core → text / --json"]
+    GUI["gui/<br/>tkinter → core → widgets"]
+
+    CLI --> CORE
+    GUI --> CORE
+
+    PROF --> CODEC["lua_table.py<br/>lossless read + write"]
     CODEC --> SLOT[("slot_N.lua")]
+    CODEC -.validate.-> ORACLE["oracle.py<br/>ctypes → Lua.framework"]
     BK --> BKDIR[("~/.krcheat/backups")]
+    LOG["log.py<br/>JSONL"] -.-> CORE
+    CFG["config.py + state.py"] -.-> CORE
 
     LIVE --> PROTO["protocol.py"]
     PROTO --> TA["transport_dylib.py<br/>(A) launch + DYLD"]
@@ -566,14 +611,16 @@ flowchart TB
     AGENT3 --> VM
     PATCH --> BYTECODE["luajit.py<br/>constant scanner"]
     BYTECODE --> LOVE[("game.love copy")]
+    DATA --> SHADOW[("shadow module in save dir")]
 ```
 
 ### 9.2 Tier 1 — save editor (no injection)
 
-Pure Python, stdlib only. Responsibilities: discover the save directory and slots, read and
-write the Lua-table format faithfully, validate against the schema, back up, and expose the
-profile operations of §8.1 (F3–F8, F14). This is the first shippable milestone because it
-cannot corrupt anything permanently (backups + atomic writes) and needs no privileges.
+Pure Python, stdlib only. Responsibilities: discover the save directory and slots, read and write
+the Lua-table format **losslessly** (§12, D1), validate against the schema, snapshot before
+writing (§15.2), and expose the profile operations of §8.1 (F3–F8, F14, and F15 where S2 allows).
+This is the first shippable milestone because it cannot corrupt anything permanently (snapshot +
+validation + atomic swap) and needs no privileges.
 
 ### 9.3 Tier 2 — live channel
 
@@ -603,6 +650,11 @@ Apple-silicon hosts, where unsigned arm64 dylibs are rejected.
 
 **Transport B (no-compiler fallback): patch `game.love`.**
 
+> **Conditional on spike S2 (D3).** If the save directory shadows the game source, Transport B
+> is *not* this. It becomes: generate one Lua source module into the save directory and let
+> `require` find it first — no ZIP repack, no pristine copy, no `repair`. The ZIP-repack
+> description below is retained as the fallback for the case where S2 fails.
+
 `game.love` is a ZIP. Replace the bytecode `main_globals.lua` (119 bytes; its entire constant
 pool is `KR_PLATFORM="mac"`, `KR_TARGET="desktop"`, `KR_GAME="kr1"`) with an equivalent **Lua
 source** module that also installs a bootstrap (command-file poller on a per-frame Lua hook).
@@ -622,7 +674,111 @@ configurable strategy.
 
 ### 9.4 Tier 3 — offline bytecode patching (optional/experimental)
 
-See §14.
+See §14. **Demoted to the backlog by D3** — it is only pursued if spike S2 fails and F15
+therefore cannot be delivered as a shadow module.
+
+### 9.5 Front-ends and the core seam (D7)
+
+The CLI is the foundation, and the way that is enforced is structural: **operations are the
+contract, not the CLI process.** All behaviour lives in `core/`; the CLI and the GUI are thin
+renderers over the same functions.
+
+| Layer | May contain | Must not contain |
+| --- | --- | --- |
+| `core/` | operations, the safety model of §15, schema knowledge, the codec, transports | `argparse`, `print`, exit codes, widgets |
+| `cli.py` | argument parsing, `Result` → text/`--json` rendering, exit codes | any operation logic |
+| `gui/` | widgets, event wiring, worker-thread marshalling | any operation logic |
+
+Every operation has one signature — `fn(ctx, **args) -> Result` — where `Result` carries the
+changed nodes, warnings, snapshot id, and the exit-code semantics of §10.5. The CLI renders a
+`Result` as text or JSON; the GUI renders the same `Result` into widgets.
+
+Consequences that must hold:
+
+* The GUI **never shells out to `krcheat`**. Doing so would create a second, divergent path and
+  lose the structured `Result`.
+* A GUI bug cannot diverge from CLI behaviour, because there is only one implementation.
+* The GUI is optional: tiers 1–3 have no dependency on Tk, and every operation remains
+  reachable from the CLI.
+
+**GUI shape.** Deliberately mirrors the original trainer's mental model, on the new safety
+model:
+
+* *Profile panel* — gems, upgrades grid, stars, hero XP; Refresh, and Apply behind a confirm
+  dialog that is the `--dry-run` diff rendered.
+* *Live panel* — game status, active transport, and Gold / Lives / Speed / God as the original
+  checkboxes; disabled unless the agent is up, with the active overrides always visible.
+* *Log pane* — tails the current diagnostic log (§9.6). This is the debugging surface.
+* *Menu* — Doctor, Open backups, Restore snapshot, View log.
+
+**Threading is mandatory, not an optimisation.** Tk is single-threaded and not thread-safe.
+Every long operation — `doctor`, `mine`, an archive repack, and especially channel requests
+with their 2 s timeout — runs on a worker thread and marshals back through a `queue.Queue`
+polled by `root.after(50, …)`. No widget is touched from a worker thread.
+
+**Safety parity.** The GUI honours the same rules as the CLI with no exceptions: snapshot
+before the first write of a run, the running-game gate, the Steam warning as a modal, and
+`--dry-run` semantics for the confirm dialog. There is no GUI-only operation.
+
+### 9.6 Diagnostic log (D8)
+
+Two **append-only JSONL** streams — one JSON object per line, flushed per record so a crash
+still leaves a usable tail:
+
+| Stream | Location | Contents |
+| --- | --- | --- |
+| CLI/GUI | `~/.krcheat/logs/krcheat-YYYYMMDD.jsonl` | command, snapshot id, file hashes before/after, changed-node count, validation results, channel request id + latency + Lua error string, tracebacks for exit 6 |
+| Agent | `$TMPDIR/krcheat/<pid>/log` (§11.3), **copied to `~/.krcheat/logs/agent-<pid>.jsonl` on clean exit** | hook selection, frame counter, snippet errors |
+
+The agent copy matters because `$TMPDIR` is reaped by the OS; without it the agent log —
+the only record of which hook was selected — is lost.
+
+Rules:
+
+1. Log **values, not contents**: hashes, paths, sizes and counts by default; field values only
+   at `-vv`, truncated.
+2. Rotation by day plus a total size cap; pruned at startup so the log can never grow without
+   bound.
+3. The log is diagnostic only. It is never read back as state, and deleting it must be safe.
+4. A logging failure is never fatal: if the log cannot be opened, the operation proceeds.
+
+CLI surface in §10.6.
+
+### 9.7 Configuration and state (D8)
+
+Configuration and state are **separate files with separate owners**. Mixing them means a
+machine-written blob eventually destroys hand-written comments — a classic and avoidable
+failure.
+
+| File | Owner | Contents |
+| --- | --- | --- |
+| `~/.krcheat/config.ini` | user, hand-editable | `[paths]` game/save-dir overrides, default slot; `[ui]` window geometry, last tab, confirm-before-write; `[live]` preferred transport, request timeout; `[logging]` level, retention |
+| `~/.krcheat/state.json` | machine | `version_string` + archive hash, slot inventory, last `doctor` summary, last snapshot id, probed live field paths, mined id sets |
+
+`configparser` and `json` are both standard library, so the Python 3.9 / no-dependency policy
+holds. TOML is deliberately excluded — `tomllib` is 3.11+ and `tomli` would be a dependency.
+Unknown keys read from `config.ini` are preserved on rewrite. Precedence is
+**CLI flag > config > state > built-in default**.
+
+`state.json` earns its place twice over: cached probe results and mined id sets are keyed on
+`version_string` + archive hash, so repeat runs skip both the S8 oracle load and the constant
+pool walk — and a game update invalidates them automatically instead of silently reusing stale
+field paths.
+
+### 9.8 Shadow data modules (F15)
+
+Conditional on S2. Where the game reads a data module from `game.love`, a same-pathed **Lua
+source** module placed in the save directory shadows it, because LÖVE mounts the save directory
+over the game source (§19 H1). F15 therefore delivers persistent level-data overrides by
+generating one such module rather than by patching bytecode.
+
+* Generation only — no ZIP surgery, no in-place bytecode edits, no re-signing.
+* Reversal is `uninstall` of the file; `data revert` restores the shipped values exactly,
+  which is verifiable by the S8 oracle (§14).
+* The generated module must be *additive*: it overrides the fields it targets and leaves the
+  rest of the table untouched, so a game update does not silently inherit stale values.
+* Removed automatically if `version_string` changes, since the shadowed module's shape is not
+  guaranteed across versions.
 
 ---
 
@@ -635,19 +791,28 @@ Global options:
 ```
 --game PATH        override app bundle path
 --save-dir PATH    override save directory
---slot N           profile slot (default: active/highest slot)
+--slot N           profile slot (default: see §19 H10 — policy not yet settled)
 --json             machine-readable output
 --dry-run          show what would change, write nothing
 --yes              assume yes for confirmations
+--force            override a safety gate (game running, version mismatch)
+--log-level L      debug | info | warn | error  (default from config)
+--log FILE         override the log destination
+--no-log           disable logging for this run
 --verbose / -v     debug logging to stderr
 --version, --help
 ```
+
+**Placement convention:** global options are written *before* the subcommand —
+`krcheat --dry-run profile set gems 9999`. This is the only documented form; the usage strings
+elsewhere in this section that show `--dry-run` after a subcommand are illustrative of the
+effect, not of the spelling.
 
 ### 10.1 Environment and diagnostics
 
 | Command | Behaviour |
 | --- | --- |
-| `krcheat doctor` | verifies: app bundle found, version, save dir present and writable, save parses, Steam Cloud state, running process, agent availability (dylib built? clang present?), and prints a summary with pass/fail per check |
+| `krcheat doctor` | verifies: app bundle found, version, save dir present and writable, save parses, Steam Cloud state, running process, agent availability (dylib built? clang present?), `_tkinter` importable and whether the interpreter is a framework build (§7.4), log directory writable, `config.ini` parses, `state.json` cache valid for the installed `version_string`, and prints a summary with pass/fail per check |
 
 ### 10.2 Profile (Tier 1)
 
@@ -678,20 +843,22 @@ Global options:
 | `krcheat repair` | re-apply Transport B after a Steam integrity check or game update |
 | `krcheat live status` | channel health: agent present, hook in use, game state, current overrides |
 | `krcheat live probe [--out FILE]` | enumerate globals/tables and dump the reachable state paths (uses the game's `lib/json.lua` for encoding) |
-| `krcheat live gold <n\|infinity\|off>` | one-shot value, per-frame override, or release |
+| `krcheat live gold <n\|infinity\|off>` | one-shot value, per-frame override, or `off` — which **restores the value captured when the override was registered** (§11.7), not merely stops enforcing |
 | `krcheat live lives <n\|infinity\|off>` | ditto |
 | `krcheat live speed <n\|off>` | simulation multiplier (`time warp`) |
 | `krcheat live god on\|off` | disable life checking (`game_outcome`) |
-| `krcheat live eval "<lua>"` | evaluate an arbitrary snippet and print the JSON result |
+| `krcheat live eval "<lua>"` | evaluate an arbitrary snippet and print the JSON result. `once`-only: arbitrary code is never installed as a per-frame override (§11.6) |
 | `krcheat live watch` | interactive prompt evaluating snippets until Ctrl-D |
 
 ### 10.4 Patching and backup
 
 | Command | Behaviour |
 | --- | --- |
-| `krcheat backup create [--label L]` / `list` / `restore <id>` / `prune --keep N` | backups of save files and (for Tier 2B/3) the game archive |
+| `krcheat backup list` | list snapshots with timestamp, path, size, hash and the command that created them |
+| `krcheat backup restore <id>` | restore a snapshot byte-identically, verified against its manifest (§15.2 step 5) |
+| `krcheat backup prune --keep N` | manual pruning. Snapshotting is automatic; retention is not (§15.4) |
 | `krcheat patch scan <value> [--module PATH] [--type number\|int]` | find constants equal to a value in a module's bytecode (e.g. `265`, `20`) |
-| `krcheat patch apply --dry-run` / `--yes` | write a patched copy of the archive |
+| `krcheat patch apply` / `--yes` | write a patched copy of the archive |
 | `krcheat patch restore` | restore the pristine archive |
 
 ### 10.5 Exit codes
@@ -705,6 +872,30 @@ Global options:
 | 4 | validation failure (schema, mandatory keys, out-of-range value) |
 | 5 | backup or restore failure |
 | 6 | internal error |
+
+### 10.6 Log, config, level data and GUI
+
+| Command | Behaviour |
+| --- | --- |
+| `krcheat log tail [--lines N]` | print the tail of the current diagnostic log (§9.6). `--json` is implied by the `--json` global; otherwise records are rendered as one line each |
+| `krcheat log path` | print the active log file path, for `tail -f` or `open -R` |
+| `krcheat log prune` | apply the retention policy now instead of at next startup |
+| `krcheat config list` / `get <key>` / `set <key> <value>` | read and write `config.ini` (§9.7), preserving unknown keys and comments |
+| `krcheat config path` | print the config file path |
+| `krcheat data list` | list the levels whose data can be overridden, and which overrides are currently installed (F15) |
+| `krcheat data set level <n> starting_gold <n>` / `starting_lives <n>` | generate or extend the shadow module for a level (§9.8) |
+| `krcheat data set wave <n> gold <n>` | ditto, for wave rewards |
+| `krcheat data revert [--level <n>]` | remove the shadow module for a level, or all of them; shipped values are restored exactly |
+| `krcheat gui` | launch the tkinter wrapper (§9.5). Fails with a clear message if `_tkinter` is unavailable |
+
+Notes:
+
+* `data *` is the F15 surface. Like `install`/`patch`, it writes into the game's *read* path
+  (the save directory) and is therefore subject to the same snapshot and gate rules.
+* `config set` writes only `config.ini`. `state.json` is machine-owned and never hand-edited;
+  it is removed, not edited, when invalidated.
+* `live status` reports the active transport, so the same information is available when both a
+  dylib agent and a patched transport are present.
 
 ---
 
@@ -727,19 +918,24 @@ Selection order is configurable via `--transport`.
 
 ### 11.2 Message format
 
-Request (Lua source to evaluate, plus correlation and mode):
+Request (Lua source to evaluate, plus correlation, mode and key):
 
 ```json
-{ "id": 42, "mode": "once", "code": "return json.encode({ gold = GAME.player_gold })" }
+{ "id": 42, "mode": "once",   "key": null,   "code": "return json.encode({ gold = GAME.player_gold })" }
+{ "id": 43, "mode": "always", "key": "gold", "code": "<snippet>" }
+{ "id": 44, "mode": "clear",  "key": "gold", "code": null }
 ```
 
 `mode` is one of:
 
-| Mode | Semantics |
-| --- | --- |
-| `once` | evaluate now, return the result |
-| `always` | evaluate every frame until replaced or cleared (the "infinity"/checkbox behaviour) |
-| `clear` | remove a previously registered `always` snippet by key |
+| Mode | `key` | Semantics |
+| --- | --- | --- |
+| `once` | ignored | evaluate now, return the result |
+| `always` | **required** | evaluate every frame until replaced or cleared (the "infinity"/checkbox behaviour). A second `always` with the same key **replaces** the first |
+| `clear` | **required** | remove a registered `always` snippet and restore the value captured when it was registered (§11.7) |
+
+The `key` is a short stable identifier (`gold`, `lives`, `speed`, `god`) and is what makes
+`live status` able to enumerate active overrides.
 
 Response:
 
@@ -747,12 +943,21 @@ Response:
 { "id": 42, "ok": true, "result": "{\"gold\":265}", "error": null, "ms": 0.4 }
 ```
 
+The response echoes `id` and `key`, and `error` carries the `lua_pcall` message verbatim when
+`ok` is false. `result` is always a string produced by the snippet itself (§11.4).
+
 ### 11.3 Channel mechanics
 
 * Directory: `$TMPDIR/krcheat/<gamepid>/` (per-process isolation, auto-cleanable).
 * Files: `cmd.json` (request), `out.json` (response), `hb` (heartbeat timestamp), `log` (agent log).
-* The agent checks `cmd.json`'s `mtime`/size each frame (a `stat` per frame is negligible),
-  executes, writes `out.json` atomically (`write` + `rename`).
+* **The request handoff is atomic.** The CLI writes `cmd.json.tmp` and renames it over
+  `cmd.json`; the agent keys on the rename rather than on content. A polling reader and a
+  writing producer otherwise race, and a torn read surfaces as an intermittent parse failure
+  that looks like an agent bug. The agent writes `out.json` by the same write-and-rename rule.
+* The agent `stat`s the channel directory once per frame (negligible) and acts only when the
+  entry changed.
+* **Response size is capped** (e.g. 1 MiB) and truncated by the agent with a marker, so a
+  `probe` dump cannot fill the channel or the caller's memory.
 * Latency target: one frame (≈16 ms at 60 fps) plus polling; CLI timeout default 2 s.
 * A unix socket alternative (`$TMPDIR/krcheat.sock`) may be added later; the file channel is
   chosen first because it is inspectable, survives agent restarts, and needs no cleanup logic.
@@ -793,17 +998,43 @@ owns that).
 
 ### 11.6 Agent hardening
 
-* Re-entrancy guard (never evaluate while a snippet is running, including from the hook).
-* Size cap on `cmd.json` (e.g. 64 KiB).
+* Re-entrancy guard (never evaluate while a snippet is running, including from the hook). The
+  guard must also survive a snippet that itself calls back into the hook.
+* Size cap on `cmd.json` (e.g. 64 KiB) **and** on `out.json` (§11.3).
 * All agent I/O wrapped so a failure cannot take down the game: on error, log and continue.
 * The agent never blocks the main thread: it reads/writes files, never waits.
+* **Snippets must not loop.** A `while true do end` inside an `always` snippet hangs the game's
+  main thread and is **not recoverable** except by force-quitting the process — the channel
+  cannot be used to fix it, because the code that would read the fix is the code that is
+  hanging. This is the one live-channel failure the design cannot undo, so it is prevented
+  structurally: `always` snippets are built from fixed templates with no user-supplied control
+  flow, and `live eval` is `once`-only.
 * Overrides are cleared on level change detection (configurable) to avoid surprising carry-over.
+
+### 11.7 Override lifecycle
+
+`always` and `clear` are not symmetric with a plain write, and the difference is the thing most
+likely to surprise a user, so it is specified explicitly:
+
+1. **On registering an `always` override, the agent first reads and stores the current value**
+   of every field the snippet touches.
+2. The agent re-applies the snippet each frame while the override is active.
+3. **`clear` restores the stored value** and removes the override. It does not merely stop
+   enforcing — otherwise the last written value silently persists and `off` would appear to do
+   nothing.
+4. **Heartbeat-based auto-clear.** If the CLI heartbeat (§11.3 `hb`) goes stale — default 10 s,
+   configurable — the agent clears all overrides and restores their stored values. A crashed or
+   forgotten CLI must not leave the game permanently modified.
+5. `live status` always reports the full set of active override keys and their current values,
+   so "what is active right now" is answerable without inspecting the game.
+
+Overrides are never persisted to the save file; tier 1 owns persistence (§12–§15).
 
 ---
 
 ## 12. Save codec specification
 
-### 12.1 Reader
+### 12.1 Reader — lossless (D1)
 
 Input subset (everything the game emits):
 
@@ -817,19 +1048,39 @@ value      := number | string | boolean | table
 string     := '"' (escaped chars) '"'
 ```
 
-Requirements: preserve numeric keys as integers, string keys as strings, full float precision
-(round-trip must be exact — `repr(float)`/`%.17g` style), booleans, empty tables, and
-tolerate/ignore the `multiRefObjects` preamble (record its presence so it can be re-emitted
-when aliasing exists).
+The reader produces an AST in which **every scalar node retains the exact source text that
+produced it**. It does not eagerly convert to Python values; typed accessors (`as_int()`,
+`as_str()`, `as_bool()`) are used by the operations that need a value, and those accessors are
+the only places a conversion happens. Structure — tables, keys, nesting, ordering, the
+`multiRefObjects` preamble — is likewise recorded as read.
 
-### 12.2 Writer
+This is what makes the writer's byte-identity guarantee (§12.2) possible, and it is why the
+reader must be a *parser* rather than an `eval`-alike.
 
-* Emit exactly the observed style: `local obj1 = {`, tab-indented entries, `["key"] = value;`,
-  `[n] = value;`, closing `}`, blank-line-free, `return obj1`.
-* Preserve key insertion order as read (the game's serializer sorts; preserving order keeps
-  diffs minimal and is safe since the reader does not depend on order).
-* Escape strings defensively (`\`, `"`, newline, control chars).
-* Emit floats so that re-reading yields the identical value.
+Requirements: preserve numeric keys as integers and string keys as strings; preserve the
+preamble when present so it can be re-emitted; preserve booleans and empty tables; tolerate
+whitespace variation without normalising it.
+
+### 12.2 Writer — re-emit verbatim, render only what changed (D1)
+
+* Every node not explicitly changed by an operation is written back as **its original source
+  text, byte for byte**.
+* Only changed nodes are rendered, in the observed style: `local obj1 = {`, tab-indented
+  entries, `["key"] = value;` / `[n] = value;`, closing `}`, blank-line-free, `return obj1`.
+* **Consequence — the core tier-1 invariant:** a command that changes nothing produces a
+  **byte-identical** file. This is the primary unit test of the codec (§16.2).
+* Key ordering and the `multiRefObjects` preamble are re-emitted verbatim, so neither is a
+  design input and neither can drift. No reordering is ever performed.
+* Strings we render are escaped defensively (`\`, `"`, newline, control characters).
+
+**Why not "emit floats so that re-reading yields the identical value".** The game's serializer
+uses Lua's default `%.14g` — visible in the observed `0.021276595744681`, which is 14
+significant digits. Re-rendering therefore *cannot* round-trip a double exactly, and `%.17g`
+would make our output stylistically different from the game's. Literal preservation sidesteps
+the problem for every value we did not touch. Values we do introduce are rendered with Python
+`repr` (shortest round-trip, up to 17 significant digits); the game truncates them to `%.14g`
+on its next save, which is harmless and matches what its own arithmetic would produce.
+
 * **Validate before swap**: re-parse the generated text with the reader and compare against the
   intended structure; only then write.
 * **Atomic write**: write to `slot_N.lua.tmp` in the same directory, `os.replace()` over the
@@ -841,44 +1092,75 @@ when aliasing exists).
 * Refuse operations that would delete a mandatory key; refuse to delete `heroes.status.*`.
 * Range-check values where the game clamps them (hero skills) and warn rather than silently
   write an out-of-range value.
-* Confirm `version_string` matches the installed game version; warn on mismatch.
+* **`version_string` mismatch fails closed** — exit 4, with `--force` to proceed. §12.3 and §15
+  previously disagreed (warn vs. fail); a mismatch is the signal that the schema we validated
+  against is not the schema on disk, so proceeding silently is the wrong default.
 
 ### 12.4 Post-write verification
 
 After writing, re-read from disk, re-validate, and report a diff summary. `--dry-run` stops
 before the write and prints the diff.
 
+When an operation ends with no changed nodes, the writer emits the original bytes and the
+post-write check additionally asserts **byte equality with the pre-write file** — the invariant
+of D1, verified rather than assumed.
+
 ---
 
 ## 13. Module specification
 
+### Validation core (`core/`)
+
 | Module | Responsibility | Key public API |
 | --- | --- | --- |
-| `krcheat/cli.py` | argument parsing, command dispatch, exit codes, output formatting | `main(argv) -> int` |
-| `krcheat/paths.py` | locate app bundle, `Contents/Resources/game.love`, save dir, slots, running process, Steam userdata | `AppBundle`, `SaveDir`, `find_slots()`, `is_running()` |
-| `krcheat/lua_table.py` | reader/writer/validator for the save grammar | `loads(text) -> Table`, `dumps(table) -> str`, `LuaTableError` |
-| `krcheat/profile.py` | Tier 1 operations, schema knowledge, id enumeration | `Profile.load()`, `.save()`, `.set_gems()`, `.set_upgrades()`, `.set_stars()`, `.set_hero_xp()`, `.unlock_achievements()` |
-| `krcheat/mine.py` | extract ids (achievements, heroes, levels, upgrades, skills) from the archive's bytecode constants | `mine_ids(love_path) -> dict[str, list[str]]` |
-| `krcheat/backup.py` | timestamped backups, restore, prune, manifest | `create(paths, label) -> BackupId`, `restore(id)`, `prune(keep)` |
-| `krcheat/live/protocol.py` | request/response dataclasses, channel paths, framing | `Request`, `Response`, `ChannelDirs` |
-| `krcheat/live/snippets.py` | parameterised Lua templates | `gold_inf(n)`, `lives_inf(n)`, `probe()`, `eval(code)` |
-| `krcheat/live/transport_dylib.py` | build/locate agent, launch with `DYLD_INSERT_LIBRARIES`, channel loop | `DylibTransport` |
-| `krcheat/live/transport_patched.py` | install/uninstall/repair the bootstrap module in `game.love` | `PatchedLoveTransport` |
-| `krcheat/live/transport_frida.py` | optional attach | `FridaTransport` |
-| `krcheat/patch/luajit.py` | bytecode constant scanning and patching | `scan(path, value)`, `patch(path, hits)` |
-| `krcheat/agent/kr_agent.c` | the injected agent | — |
+| `krcheat/core/profile.py` | Tier 1 operations, schema knowledge | `Profile.load()`, `.save()`, `.set_gems()`, `.set_upgrades()`, `.set_stars()`, `.set_hero_xp()`, `.unlock_achievements()` |
+| `krcheat/core/lua_table.py` | lossless reader, verbatim writer, validator for the save grammar (§12) | `parse(text) -> Ast`, `render(ast) -> str`, `LuaTableError` |
+| `krcheat/core/oracle.py` | S8 — `ctypes` binding to the shipped `Lua.framework`; validates generated saves and patched modules against the real VM; dumps data-module tables for id enumeration (D4) | `Oracle.load_chunk(bytes, name) -> object`, `Oracle.eval(text) -> object`, `available() -> bool` |
+| `krcheat/core/mine.py` | extract ids (achievements, heroes, levels, upgrades, skills), preferring the S8 oracle over constant-pool heuristics | `mine_ids(love_path) -> dict[str, list[str]]` |
+| `krcheat/core/data.py` | F15 shadow-module generation, listing and revert (§9.8) | `list_overrides()`, `set_level_data(n, key, value)`, `revert(level=None)` |
+| `krcheat/core/backup.py` | snapshot before write, restore, manifest, hash verification (§15.2) | `snapshot(paths, label) -> SnapshotId`, `restore(id)` |
+| `krcheat/core/log.py` | append-only JSONL diagnostic log, rotation, pruning (§9.6) | `configure(**opts)`, `get_logger(name)` |
+| `krcheat/core/config.py` | `config.ini` read/write with unknown-key preservation (§9.7) | `load() -> Config`, `Config.set(key, value)`, `path()` |
+| `krcheat/core/state.py` | machine-owned `state.json` cache, keyed on `version_string` + archive hash (§9.7) | `load()`, `put(key, value)`, `invalidate()` |
+| `krcheat/core/paths.py` | locate app bundle, `game.love`, save dir, slots, running process, Steam userdata | `AppBundle`, `SaveDir`, `find_slots()`, `is_running()` |
+| `krcheat/core/live/protocol.py` | request/response dataclasses, channel paths, framing, atomic handoff (§11.2–11.3) | `Request`, `Response`, `ChannelDirs` |
+| `krcheat/core/live/snippets.py` | parameterised Lua templates, no user-supplied control flow (§11.6) | `gold_inf(n)`, `lives_inf(n)`, `probe()`, `eval(code)` |
+| `krcheat/core/live/transport_dylib.py` | build/locate agent, launch with `DYLD_INSERT_LIBRARIES`, channel loop | `DylibTransport` |
+| `krcheat/core/live/transport_patched.py` | install/uninstall/repair the bootstrap module | `PatchedLoveTransport` |
+| `krcheat/core/live/transport_frida.py` | optional attach | `FridaTransport` |
+| `krcheat/core/patch/luajit.py` | bytecode constant scanning and patching (§14) | `scan(path, value)`, `patch(path, hits)` |
+
+### Front-ends (§9.5)
+
+| Module | Responsibility | Key public API |
+| --- | --- | --- |
+| `krcheat/cli.py` | argument parsing, dispatch, exit codes, `Result` → text/`--json` | `main(argv) -> int` |
+| `krcheat/gui/app.py` | tkinter wrapper: profile panel, live panel, log pane, menu | `run(argv) -> int` |
+| `krcheat/gui/worker.py` | worker thread + `queue.Queue` + `root.after` marshalling | `submit(fn, **args)` |
+| `krcheat/gui/dialogs.py` | snapshot/confirm/diff dialogs, Steam warning modal | `confirm_write(result) -> bool` |
+
+### Agent (native)
+
+| Module | Responsibility | Key public API |
+| --- | --- | --- |
+| `krcheat/agent/kr_agent.c` | the injected agent: state capture, frame hook, channel polling, override table | — |
 | `krcheat/agent/Makefile` | `clang -dynamiclib -arch x86_64 -arch arm64` + `codesign -s -` | — |
 
-**Dependency policy:** tiers 1 and 3 use the Python standard library only. Tier 2 adds no Python
-dependencies for transports A and B; transport C requires `frida`.
+**Dependency policy:** the standard library only, for **all** tiers and both front-ends.
+Specifically: `ctypes` for the S8 oracle (D4), `json` for the log and `state.json`,
+`configparser` for `config.ini`, `argparse` for the CLI, `tkinter` for the GUI. `tomllib` is
+excluded as 3.11+, and `tomli` would be a dependency (§9.7). Transport C (`frida`) remains the
+single optional third-party dependency and is the last resort.
 
 ---
 
 ## 14. Bytecode patcher specification
 
-**Status: experimental, stretch goal.** Included because the data modules
-(`kr1/data/levels/*`, `kr1/data/waves/*`) are pure data and the constants are plaintext, making
-a "permanent mod" possible without any runtime channel.
+**Status: backlog, pending D3.** Demoted from "stretch goal" by the review of 2026-09-16. If
+spike S2 confirms save-directory shadowing, its principal use case (F15, persistent level data)
+is delivered by a generated Lua source module (§9.8) — no hex editing, no ZIP surgery, no
+signature concerns — and this tier is only revisited if S2 fails. The technique remains
+documented because it is the only offline path that works when the read path cannot be shadowed.
 
 * LuaJIT bytecode header: `1B 4C 4A 02` (magic `ESC` `L` `J`, version `2`).
 * String constants are stored as `GCstr` objects with a length prefix followed by the bytes, so
@@ -887,36 +1169,104 @@ a "permanent mod" possible without any runtime channel.
   constants / module), verify the byte distance to the enclosing constant-table entry, replace
   the payload in place (same width ⇒ no size or offset changes anywhere in the file), then
   rebuild the ZIP entry.
-* Candidate use cases: level starting gold (the Windows trainer's defaults were `265` gold and
-  `20` lives), lives per level, wave gold rewards (`kr1/data/waves/levelNN_waves_*.lua`).
+* Candidate use cases, if S2 fails: level starting gold (the Windows trainer's defaults were
+  `265` gold and `20` lives), lives per level, wave gold rewards
+  (`kr1/data/waves/levelNN_waves_*.lua`).
 * Safety: always operate on a copy; `--dry-run` prints a hex diff; `krcheat patch restore`
   restores the pristine archive; a failed patch must leave the original untouched.
-* Validation difficulty: without a standalone LuaJIT 2.1 interpreter available, the patched
-  module cannot be loaded out-of-process for a smoke test, so validation relies on structural
-  checks plus an in-game test. This is why the tier is marked experimental.
+* **Validation is no longer the blocker it was.** The shipped `Lua.framework` is a LuaJIT 2.1
+  VM identical to the game's own, and §13's `core/oracle.py` binds it through `ctypes` — so a
+  patched module **can** be loaded out of process and smoke-tested before the game ever sees it.
+  The tier stays on the backlog for scope reasons (D3), not for lack of a verification story.
 
 ---
 
 ## 15. Safety model
 
+**Scope: file-level (D6).** The safety model covers the write path to the files we own. It does
+not attempt operation-level undo, a change journal, retention policy management, or bundle
+rollback. Those were considered and deliberately dropped as disproportionate to a single-player
+save editor; §15.4 records what that costs.
+
+### 15.1 Threat model
+
+Ordered by likelihood, not severity:
+
+| # | Hazard | Consequence | Addressed by |
+| --- | --- | --- | --- |
+| 1 | Game rewrites `slot_N.lua` over our edit | silent, recoverable | §15.3 gate |
+| 2 | Steam Cloud restores an older copy | silent, destructive | §15.5 |
+| 3 | Our own serializer emits something the game rejects → **the game deletes the slot** (§5.1) | destructive | §15.2 steps 2–3, and D1 |
+| 4 | Partial write / power loss mid-write | destructive | §15.2 step 3 (atomic swap) |
+| 5 | The original is lost because the snapshot was bad or missing | destructive | §15.2 step 1 (fail-closed) |
+| 6 | A live snippet crashes or hangs the game process | annoying, not data loss | §11.6 |
+
+Hazards 3 and 5 are the only ones that can destroy data irretrievably, and both are handled
+before a single byte of the original is touched.
+
+### 15.2 The write path
+
+Every mutating command follows exactly these steps, in this order. There is no code path that
+writes to a save file without traversing them.
+
+1. **Snapshot before the first write.** Copy the target `slot_N.lua` byte-exact to
+   `~/.krcheat/backups/<timestamp>/`, with a manifest recording the source path, its SHA-256,
+   the game version and the invoking command. **If the snapshot fails, abort — exit 5, nothing
+   written, no partial state.** The snapshot is part of the write path, not a separate command
+   the user must remember to run.
+2. **Validate before swap.** Re-parse the text we are about to write with the reader and compare
+   it against the intended structure; check mandatory keys and that no key was deleted (§12.3).
+3. **Atomic swap.** Write `slot_N.lua.tmp` in the same directory and `os.replace()` over the
+   original — atomic on APFS. The original is never truncated in place.
+4. **Verify after swap.** Re-read from disk and compare against the intended structure; report a
+   diff summary. This catches a third party writing between step 2 and step 3.
+5. **Restore is byte-identical.** `krcheat backup restore <id>` returns the snapshot as it was,
+   verified by hash against the manifest.
+
+`--dry-run` stops after step 1 (without writing the snapshot) and prints the diff that step 4
+would have reported.
+
+### 15.3 Preconditions (D2)
+
+| Condition | Behaviour |
+| --- | --- |
+| Game process running | **Refuse** (exit 3). `--force` overrides. The game rewrites the slot on progress saves, so editing mid-session is either clobbered or resurrects stale state — this is unambiguous and never worth ignoring |
+| Steam running | **Warn prominently**, require `--yes`. Not a refusal: Steam is usually running for unrelated reasons, and on next launch it sees our newer local file and uploads it, which is the outcome we want |
+| `doctor` has not passed | Tier-2 commands refuse to start. Tier 1 is unaffected |
+| `version_string` mismatch | Refuse (exit 4); `--force` overrides |
+
+The asymmetry between the first two rows is deliberate: one is always wrong, the other is
+usually fine.
+
+### 15.4 What we deliberately accept
+
+* **Restore granularity is the run, not the operation.** If a run contains three `set`
+  commands and the second was wrong, restoring returns you to before the run. Accepted: it is
+  a CLI, and each invocation is short.
+* **No change journal.** "What did I change last month?" is answered by `backup list` and the
+  snapshot manifest, not by a dedicated log of diffs.
+* **No automatic retention policy.** Snapshots are ~7 KB and accumulate until
+  `krcheat backup prune --keep N` is run. The diagnostic log (§9.6) *is* rotated automatically,
+  because it is the one file that grows without bound.
+* **No bundle rollback.** `install`/`patch` keep a pristine archive and `uninstall`/`repair`
+  restore from it; there is no general undo for the game installation.
+
+Much of what would otherwise need machinery is instead handled by D1: because untouched bytes
+are re-emitted verbatim, the realistic failure surface is reduced to the values we deliberately
+changed, and "did the tool corrupt my save?" becomes a byte-comparison question rather than an
+analytical one.
+
+### 15.5 Hazards outside the write path
+
 | Hazard | Mitigation |
 | --- | --- |
-| Corrupting the profile (game deletes invalid slots, see §5.1) | timestamped backup before every write; schema validation; re-parse the generated file before swapping; never delete keys |
-| Partial write / power loss | write to `.tmp` in the same directory + `os.replace()` (atomic on APFS) |
-| **Steam Cloud overwriting local edits** (or uploading cheated saves) | `doctor` detects `remotecache.vdf` and reports cloud state; a warning is emitted before writing when Steam is running; editing while Steam is closed is recommended; a post-restore resync note is printed |
-| Steam reverting a patched `game.love` | keep a pristine copy; `krcheat repair` re-applies; `uninstall` restores |
-| Breaking the bundle's code signature (Transport B / Tier 3) | prefer Transport A; when modifying resources, note that only the *resource seal* is invalidated (the executable's signature is untouched) and Steam-installed apps are not quarantined, so Gatekeeper does not block launch; the CLI always keeps the pristine archive |
-| Crashing the game via a live snippet | snippets are validated and reversible; the agent catches all Lua errors and never re-raises into the game; overrides are explicit and clearable; `live status` always shows what is active |
+| **Steam Cloud overwriting local edits**, or uploading cheated saves | `doctor` detects `remotecache.vdf` and reports cloud state; a prominent warning is emitted before writing when Steam is running; editing with Steam closed is recommended in the README; a post-restore resync note is printed |
+| Steam reverting a patched `game.love` | keep a pristine copy; `krcheat repair` re-applies; `uninstall` restores. Reduced in scope by D3 — if S2 holds, Transport B and F15 touch only the save directory and this row disappears |
+| Breaking the bundle's code signature (Transport B / Tier 3) | prefer Transport A; when resources are modified, only the *resource seal* is invalidated (the executable's signature is untouched) and Steam-installed apps are not quarantined, so Gatekeeper does not block launch; the CLI always keeps the pristine archive |
+| Crashing or **hanging** the game via a live snippet | the agent catches all Lua errors and never re-raises into the game; overrides are explicit, enumerable and auto-cleared on heartbeat loss (§11.7); snippets cannot loop (§11.6). A hang is the one unrecoverable live failure, so it is prevented structurally rather than mitigated |
 | Apple-silicon portability | ad-hoc sign the agent dylib (`codesign -s -`); Transport B needs no native code at all |
-| Game updates changing field names/paths | no hard-coded addresses anywhere; the channel re-discovers paths via `probe`; tier 1 fails loudly (not silently) if `version_string` differs |
-| Accidentally shipping copyrighted content | the repo must never contain extracted game assets or bytecode; only ours |
-
-Operational rules:
-
-1. Any mutating command creates a backup first; if the backup fails, abort (exit 5).
-2. `--dry-run` is honoured by every mutating command.
-3. The tool never writes to the game bundle unless the user explicitly runs `install`/`patch`.
-4. `doctor` must pass before tier-2 commands run.
+| Game updates changing field names/paths | no hard-coded addresses anywhere; the channel re-discovers paths via `probe`; the `state.json` cache and the F15 shadow modules are keyed on `version_string` and invalidated on change (§9.7–9.8); tier 1 fails closed on `version_string` mismatch |
+| Accidentally shipping copyrighted content | the repo must never contain extracted game assets or bytecode; only ours. The S8 oracle extracts to a temp directory at runtime and never commits what it reads |
 
 ---
 
@@ -924,27 +1274,47 @@ Operational rules:
 
 ### 16.1 Pre-implementation spikes (M0)
 
+**Ordering (D3): S2 runs first, before M1.** It is a 15-minute experiment that can delete a
+milestone (M5) and demote another (M7), and it costs nothing to run ahead of tier 1 because
+tier 1 needs no transport at all.
+
 | ID | Question | Method | Pass criterion |
 | --- | --- | --- | --- |
 | **S1** | Does the game accept a hand-edited slot? | change `gems` by hand, restart, observe | the new value is displayed; no slot-deleted warning |
-| **S2** | Is the save directory searched before the game source for `require` in LÖVE 0.10.1? | drop a shadow `main_globals.lua` (Lua source) into the save dir that writes a marker file | marker file appears ⇒ Transport B becomes a 20-line drop-in instead of a 358 MB repack (see §19 H1) |
+| **S2** | Is the save directory searched before the game source for `require` in LÖVE 0.10.1? | drop a shadow `main_globals.lua` (Lua source) into the save dir that writes a marker file | marker file appears ⇒ **Transport B collapses to "drop one file", M5 shrinks, M7 is demoted to backlog, and F15 is delivered by §9.8 rather than by bytecode patching** (see §19 H1) |
 | **S3** | Can we load a dylib into the game? | build a hello-world dylib, `DYLD_INSERT_LIBRARIES` launch, log a line | log line present in the agent log file |
 | **S4** | Which per-frame hook works? | try `SDL_GL_SwapWindow`, then `SDL_PollEvent`, then `Graphics::present` | a counter reaches ≥ 30 within one second |
 | **S5** | Is the main `lua_State` captured by interposing `luaL_newstate`? | log the pointer; sanity-check `lua_gettop` | non-null pointer, `lua_gettop` returns a small sane value |
-| **S6** | What is the owner path of `player_gold` / `lives`? | run `probe` and grep the dumped globals | a concrete, reachable path such as `store.game.player_gold` |
+| **S6** | What is the owner path of `player_gold` / `lives`? | run `probe` and grep the dumped globals | a concrete, reachable path such as `store.game.player_gold`, **and** a read-back after a write that confirms the assignment took effect (see §18) |
 | **S7** | Does the game start outside Steam? | launch the executable directly | reaches the main menu (Steam features may be degraded) |
+| **S8** | Can `core/oracle.py` drive the shipped `Lua.framework` from Python via `ctypes`? | extract a data module to a temp dir, `luaL_loadbuffer` + `lua_pcall` it, dump the resulting table | the table round-trips to JSON and matches what `mine` would report. **Answers H5 and H6 directly**, and removes the §14 validation blocker (D4) |
+
+S2's outcome is a branch point, not just a data point:
+
+| S2 result | Consequence |
+| --- | --- |
+| **passes** | Transport B = one generated file in the save dir. M5 shrinks to a file writer. M7 demoted to backlog. F15 ships as §9.8. The Steam-reverts-the-bundle and signature hazards (§15.5) largely disappear. |
+| **fails** | Transport B keeps the ZIP repack and `repair`; F15 moves to tier 3 and inherits §14's risks; M7 is restored to a real milestone. |
 
 ### 16.2 Test layers
 
-* **Unit tests** — `lua_table` round-trip (including full-precision floats, nesting, mixed keys,
-  `multiRefObjects` preamble), `backup` create/restore/prune, `mine` id extraction against a
-  synthetic bytecode fixture, snippet generation.
+* **Unit tests** — `lua_table` **byte-identity round-trip** (parse → render → assert byte-equal)
+  over synthetic fixtures covering nesting, mixed `["k"]`/`[n]` keys, booleans, empty tables,
+  `%.14g`-style floats, and the `multiRefObjects` preamble; targeted node edits (asserting only
+  the intended bytes changed); `backup` snapshot/restore hash verification; `config` unknown-key
+  preservation; `state` invalidation on version change; `mine` id extraction; snippet generation
+  (asserting the templates contain no user-supplied control flow, §11.6).
+* **Oracle tests (S8)** — load every generated fixture in the real LuaJIT VM via
+  `core/oracle.py` and compare the resulting table against the intended structure. This is the
+  authoritative check: it uses the same VM and the same `loadstring` path the game does, so a
+  file that passes here is one the game's storage layer will accept. Skipped (not failed) when
+  the game is not installed.
 * **Golden tests** — a checked-in *synthetic* save file (never a real one) asserting exact
-  serialiser output.
+  rendered output, plus a no-op command asserting a byte-identical result.
 * **Integration tests (manual, documented)** — the acceptance criteria of §8.2, each with
   before/after screenshots or log excerpts.
-* **Regression guard** — `krcheat doctor` plus a `--self-test` flag that exercises the codec and
-  backup paths without touching the game.
+* **Regression guard** — `krcheat doctor` plus a `--self-test` flag that exercises the codec,
+  snapshot and config paths without touching the game.
 
 ### 16.3 Verification evidence to keep
 
@@ -958,18 +1328,23 @@ write was rejected).
 
 | # | Milestone | Deliverable | Depends on | Effort |
 | --- | --- | --- | --- | --- |
-| M0 | Spikes S1–S7 | short findings note, decisions recorded in this document | — | 0.5–1 d |
-| M1 | **Tier 1 core** | `doctor`, `profile show/get/set`, `backup`, codec + tests | S1 | 1–2 d |
-| M2 | **Tier 1 complete** | `mine` id enumeration, all F3–F8 commands, `list` | M1 | 1 d |
+| M0 | **Spikes, S2 first** | S2 → then S1, S8, S3–S7; findings note with the scope branch recorded (D3) | — | 0.5–1 d |
+| M1 | **Tier 1 core + write path** | `core/` skeleton, `cli.py`, `doctor`, `profile show/get/set`, snapshot/restore (§15.2), logging and config/state (§9.6–9.7), lossless codec + byte-identity tests | S1 | 2–3 d |
+| M2 | **Tier 1 complete + F15** | S8-backed `mine`, all F3–F8 commands, `list`, and `data *` (F15) if S2 held | M1, S8 | 1–2 d |
 | M3 | **Agent** | `kr_agent.c` + Makefile, launch, channel, `probe`, `eval`, `status` | S3–S6 | 2–3 d |
-| M4 | **Live features** | `gold`, `lives`, `speed`, `god`, `always` mode | M3 | 1–2 d |
-| M5 | **Transport B** | install/uninstall/repair for the `game.love` bootstrap | S2 | 1 d |
-| M6 | **Packaging and docs** | `pyproject.toml`, `pipx` install, manpage-style README, troubleshooting | M4 | 0.5–1 d |
-| M7 | **Tier 3 (optional)** | bytecode scanner/patcher with dry-run | M4 | 2–3 d |
+| M4 | **Live features** | `gold`, `lives`, `speed`, `god`, `always`, override lifecycle (§11.7) | M3 | 1–2 d |
+| M5 | **Transport B** | *if S2 held:* a generated file in the save dir (~0.5 d). *If not:* install/uninstall/repair with the ZIP repack (~1 d) | S2 | 0.5–1 d |
+| M6 | **Packaging and docs** | `pyproject.toml`, `pipx` install, README, troubleshooting | M4 | 0.5–1 d |
+| M7 | **GUI (F16)** | `gui/` over `core/`: profile panel, live panel, log pane, worker-thread marshalling, dialogs | M4, M6 | 2–3 d |
+| M8 | **Tier 3 (backlog)** | bytecode scanner/patcher with dry-run and oracle validation — only if S2 failed | S2 failed, M4 | 2–3 d |
 
-Ordering rationale: M1 ships user-visible value (F3–F8, i.e. the original trainer's "Upgrades"
-feature and more) with zero risk and zero prerequisites; M3–M4 delivers the runtime features
-(F1/F2) once the spikes have removed the unknowns.
+Ordering rationale: S2 runs first because its result changes the shape of M5 and can remove M8
+entirely (D3); it is nearly free because tier 1 needs no transport. M1 then ships user-visible
+value (F3–F8, i.e. the original trainer's "Upgrades" feature and more) with zero risk and zero
+prerequisites. M3–M4 delivers the runtime features (F1/F2) once the spikes have removed the
+unknowns. M7 comes after M4 because the GUI's two checkbox equivalents are the live features —
+before them it would just be a save editor with chrome — and after M6 because it wraps a `core/`
+that should already be stable.
 
 ---
 
@@ -978,10 +1353,17 @@ feature and more) with zero risk and zero prerequisites; M3–M4 delivers the ru
 | Risk | Likelihood | Impact | Mitigation |
 | --- | --- | --- | --- |
 | Live owner path cannot be resolved cleanly (S6 fails) | medium | medium | fall back to (a) a broader `probe` that walks `_G` recursively, (b) `debug.getregistry()`/upvalue inspection from a Lua hook installed at game call sites, (c) enabling the shipped `all/debug_tools.lua` helpers |
+| **The field resolves but assignment is a silent no-op** (state behind a proxy table or `__newindex`) | medium | medium | S6's pass criterion now requires a **read-back after the write**, not just a resolved path (§16.1); the snippet contract requires re-reading after setting |
+| **A hanging `always` snippet** | low | **high — unrecoverable** | prevented structurally, not mitigated: no user control flow in `always` snippets, `live eval` is `once`-only, heartbeat auto-clear (§11.6–11.7). After the fact there is no recovery but force-quit |
+| **S2 fails** — the save dir does not shadow the game source | medium | medium | the plan branches explicitly (§16.1): M7 is restored, F15 moves to tier 3 and inherits §14's risks. No other milestone depends on it |
 | `SDL_GL_SwapWindow` is not called (different presentation path) | low | medium | ordered fallback list (§7.3); worst case a Lua-level hook |
 | Game refuses to run outside Steam | low | high for Transport A | set `SteamAppId=246420`; if it still fails, switch to Transport B (normal Steam launch) |
-| Steam Cloud clobbers edits | medium | medium | warnings, backups, recommend Cloud off / Steam closed |
-| Bundle modifications break launch | low | medium | prefer Transport A; keep pristine copies; documented restore |
+| Steam Cloud clobbers edits | medium | medium | pre-write warning gated behind `--yes` (§15.3), snapshots, recommend Cloud off / Steam closed in the README |
+| Bundle modifications break launch | low | medium | prefer Transport A; keep pristine copies; documented restore. Largely eliminated by D3 — if S2 holds, M5 and F15 touch only the save directory |
+| **The S8 oracle cannot load a module** (it depends on `love.*` / `klua.*` globals) | medium | low | stub the missing globals before `lua_pcall`; fall back to constant-pool mining for that module only. The oracle enhances `mine`, it is not its only path |
+| **Tk unavailable, or a non-framework Python** (pyenv builds often omit `_tkinter`) | medium | low | the GUI is optional and the CLI is unaffected; `doctor` reports both conditions so the failure is diagnosed rather than mysterious (§7.4) |
+| **GUI diverges from CLI behaviour** | low | medium | structural: one `core/`, two renderers, and the GUI never shells out to `krcheat` (D7, §9.5) |
+| Lossless codec is harder than re-rendering (literal preservation) | low | medium | the byte-identity test is the acceptance criterion and is trivial to assert (§16.2) |
 | Python 3.9 floor constrains syntax | certain | low | encode the constraint in `pyproject.toml` and CI |
 | Field names differ from the bytecode constants (locals vs fields) | medium | low | runtime discovery, not static assumptions |
 | Overflowing/clamped values rejected by the game | medium | low | range checks + warnings; re-read after write |
@@ -994,9 +1376,25 @@ feature and more) with zero risk and zero prerequisites; M3–M4 delivers the ru
 **H1 — save-directory `require` precedence (LÖVE 0.10.1).** Whether a Lua source file placed in
 `~/Library/Application Support/kingdom_rush/` shadows the same-named module inside `game.love`
 for `require`. This could not be resolved offline (the LÖVE wiki returns HTTP 403 to this
-environment, and the upstream 0.10.1 `Filesystem.cpp` blob could not be extracted in full). If
-true, Transport B reduces to dropping one generated file and needs no archive repacking.
-Resolve with spike S2.
+environment, and the upstream 0.10.1 `Filesystem.cpp` blob could not be extracted in full).
+
+**Expectation: yes.** LÖVE 0.10.1 mounts the save directory on top of the game source inside
+`love.filesystem.setIdentity`, and PhysFS resolves from the most recently mounted archive first;
+`love.filesystem.load` then compiles whatever `require` finds, and LuaJIT auto-detects source vs
+bytecode by the `1B 4C 4A` header, so shadowing a `.lua` bytecode module with source is
+transparent. Unverified, and S2 decides it.
+
+If true, the consequences are larger than "Transport B gets cheaper" (D3):
+
+* Transport B becomes *dropping one generated file* — no repack, no pristine copy, no `repair`,
+  no signature question, and trivially reversible.
+* **Tier 3's principal use case disappears.** F15 is delivered by shadowing a data module with
+  generated Lua source (§9.8) instead of patching bytecode in place — same permanent effect for
+  starting gold/lives and wave rewards, none of the §14 risk.
+* The file we add lives in the save directory, which Steam Cloud does **not** mirror (only
+  `slot_1.lua` appears in `remotecache.vdf`), so the shadow module is outside the cloud hazard.
+
+Resolve with spike S2, which runs first (§16.1).
 
 **H2 — the exact owner chain of the live level state.** See §6.2 / S6.
 
@@ -1010,27 +1408,53 @@ release build. Whether the underlying fields are still present and writable must
 diffing the save.
 
 **H5 — `levels[n][1..3]` mapping.** Campaign/heroic/iron for story levels and
-casual/normal/veteran for endless levels is inferred from the leaderboard mappings; confirm by
-completing one mode of one level and diffing.
+casual/normal/veteran for endless levels is inferred from the leaderboard mappings. **S8 should
+settle this offline** by loading `kr1/data/levels/*_data.lua` in the oracle VM and dumping the
+tables, rather than by completing a level and diffing saves; the in-game diff remains the
+confirmation.
 
 **H6 — hero skill value ranges.** `all/storage.lua` clamps out-of-range skills to 0, so the
-valid range per skill must be learned from `kr1/data/*` before offering skill editing.
+valid range per skill must be learned before offering skill editing. **S8 is the intended route**
+— the ranges live in `kr1/data/*` and are readable by executing those modules in the oracle.
+Until then, `profile set hero <id> skills` stays unimplemented rather than guessed.
 
 **H7 — additional slot files.** `slot_common`, `slot_kr1_endless`, `slot_kr2`, `slot_kr3`,
-`slot_kr3_endless` appear in the mapping table but not (yet) on disk. Determine when the game
-creates them and whether the CLI should manage them.
+`slot_kr3_endless` appear in the mapping table but not (yet) on disk. **Assessment: probably
+inert.** The mapping table is shared across Ironhide titles, and a KR1 build carrying KR2/KR3
+slot families is more likely dead configuration than a latent file set. `find_slots()` globs
+`slot_*.lua` and reports what exists; it must **not** provision slots the game has not created.
+Confirm by listing the save directory before and after a full play session.
 
-**H8 — Steam Cloud conflict policy.** Whether writing while Steam is running is reliably safe,
-or whether the CLI should hard-require Steam to be closed.
+**H8 — Steam Cloud conflict policy. Closed by D2.** Steam running is a prominent warning gated
+behind `--yes`, not a hard requirement: `remotecache.vdf` state cannot be predicted reliably
+enough to justify blocking, and on next launch Steam sees our newer local file and uploads it,
+which is the outcome we want. The game-running gate is the hard one (§15.3), because that
+failure is unambiguous.
 
 **H9 — achievement propagation.** Whether flags written into the save propagate to Steam
 achievements on the next sync, or only change the in-game state.
+
+**H10 — the default-slot policy (open, introduced by this review).** `--slot N` exists, and
+`doctor`/`backup` are slot-aware, but nothing defines what "the active slot" means. §5.1
+references an `active_slot_idx` and the error string *"slot %s must exist before setting it as
+active"*, which implies it is persisted — but the measured `global.lua` (§5.6) does not contain
+it, so its source of truth is unverified. Three candidates, all defensible: highest-numbered
+slot, newest mtime, or a value read from `global.lua`. Resolve before M1, since the default
+affects every tier-1 command; the answer determines whether `paths.find_slots()` needs to read
+game state at all.
+
+**H11 — whether a shadow module must be removed on version change.** §9.8 removes F15 shadow
+modules automatically when `version_string` changes, on the assumption that the shadowed
+module's shape is not guaranteed across versions. That is a conservative choice; if the data
+modules prove stable across updates, keeping the override and warning instead of deleting it
+would be friendlier. Decide after the first game update observed with F15 installed.
 
 ---
 
 ## 20. Non-goals
 
-* No GUI (the CLI is sufficient).
+* No GUI toolkit other than tkinter, and no web/Electron UI. The tkinter wrapper of §9.5 is a
+  thin renderer over `core/`, not a second implementation.
 * No Windows/Unity support; the existing trainer remains for that platform.
 * No bypass of Steam ownership/DRM checks.
 * No redistribution of game assets, bytecode or extracted data.

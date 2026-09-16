@@ -50,25 +50,43 @@ Suggested reading order: foundation §2 (executive summary) → §3 (target prof
 krtrainer/
 ├── KRCHEAT_FOUNDATION.md       # canonical spec
 ├── MACOS_TRAINER_PROPOSAL.md   # earlier proposal
-└── krcheat/                    # the CLI (not yet implemented)
-    ├── cli.py
-    ├── paths.py
-    ├── lua_table.py            # save codec (read/write/validate)
-    ├── profile.py              # Tier 1: save editing
-    ├── mine.py                 # id extraction from the archive
-    ├── backup.py
-    ├── live/                   # Tier 2: in-process Lua channel
-    └── patch/                  # Tier 3: LuaJIT bytecode patcher (optional)
+└── krcheat/                    # not yet implemented
+    ├── cli.py                  # argparse → core → text / --json
+    ├── gui/                    # tkinter → core → widgets (optional)
+    ├── core/
+    │   ├── profile.py          # Tier 1: save editing
+    │   ├── lua_table.py        # lossless save codec (read/write/validate)
+    │   ├── oracle.py           # ctypes → the game's own Lua.framework
+    │   ├── mine.py             # id extraction from the archive
+    │   ├── backup.py           # snapshot / restore
+    │   ├── log.py              # append-only JSONL diagnostic log
+    │   ├── config.py           # config.ini (user settings)
+    │   ├── state.py            # state.json (machine-owned cache)
+    │   ├── data.py             # F15: shadow data modules
+    │   ├── paths.py
+    │   ├── live/               # Tier 2: in-process Lua channel
+    │   └── patch/              # Tier 3: LuaJIT bytecode patcher (backlog)
+    └── agent/                  # the injected dylib
 ```
+
+The CLI is the foundation: all behaviour lives in `core/`, and both `cli.py` and `gui/` are thin
+renderers over the same functions. A GUI bug cannot diverge from CLI behaviour, because there is
+only one implementation.
 
 Three tiers, in delivery order:
 
 1. **Tier 1 — save editor** (pure Python, stdlib only): upgrades, stars, gems, hero XP,
-   achievements, `seen` unlocks; with backups and schema validation. No injection, no root.
+   achievements, `seen` unlocks, and persistent per-level data (starting gold/lives, wave
+   rewards); with snapshots, schema validation and atomic writes. No injection, no root.
 2. **Tier 2 — live channel**: gold, lives, speed and god mode via an in-process agent, reached
    by launching the game with an injected dylib (preferred) or by patching `game.love` (no
    compiler required).
-3. **Tier 3 — offline bytecode patching** (optional): permanent tweaks in a copy of the archive.
+3. **Tier 3 — offline bytecode patching** (backlog): permanent tweaks in a copy of the archive.
+   Expected to be unnecessary — if spike S2 confirms that the save directory shadows the game
+   source, tier 1 delivers the same permanent effects with a generated Lua module instead.
+
+An optional **tkinter GUI** (`krcheat gui`) wraps the same core, and is a renderer rather than a
+second implementation. The CLI remains complete on its own.
 
 ---
 
@@ -77,16 +95,19 @@ Three tiers, in delivery order:
 | Milestone | State |
 | --- | --- |
 | Reverse engineering + specification | done |
-| M0 — assumption spikes (S1–S7) | not started |
-| M1 — Tier 1 save editor | not started |
-| M2 — Tier 1 complete | not started |
+| Specification review (D1–D8, see [§2.1](KRCHEAT_FOUNDATION.md#21-design-decisions-review-of-2026-09-16)) | done |
+| M0 — assumption spikes, **S2 first** | not started |
+| M1 — Tier 1 core + write path | not started |
+| M2 — Tier 1 complete + F15 | not started |
 | M3–M4 — live channel | not started |
-| M5–M7 — patched transport, packaging, bytecode patcher | not started |
+| M5–M6 — transport B, packaging | not started |
+| M7 — tkinter GUI | not started |
+| M8 — bytecode patcher (backlog) | not started |
 
 Two questions are explicitly unresolved and are listed as spikes rather than assumptions:
-save-directory `require` precedence in LÖVE 0.10.1, and the runtime owner chain of
-`player_gold` / `lives`. Both are in
-[open questions](KRCHEAT_FOUNDATION.md#19-open-questions).
+spike **S2** (save-directory `require` precedence in LÖVE 0.10.1 — expected to pass, and it
+changes the shape of M5 and M8) and **S6** (the runtime owner chain of `player_gold` / `lives`).
+Both are in [open questions](KRCHEAT_FOUNDATION.md#19-open-questions).
 
 ---
 
@@ -94,7 +115,16 @@ save-directory `require` precedence in LÖVE 0.10.1, and the runtime owner chain
 
 Cheating is limited to a single-player game the user owns. The project deliberately:
 
-- never modifies the game installation unless explicitly asked (`install` / `patch`);
-- backs up every file it touches and writes atomically;
+- **snapshots before it writes** — every mutating command copies the save file to
+  `~/.krcheat/backups/` first, and aborts if the snapshot fails;
+- **writes atomically** — a temp file and `os.replace()`, never a truncate in place;
+- **is lossless** — untouched bytes are re-emitted verbatim, so a command that changes nothing
+  produces a byte-identical file ([§12](KRCHEAT_FOUNDATION.md#12-save-codec-specification));
+- **refuses to write while the game is running**, and warns before writing while Steam is;
+- **never modifies the game installation** unless explicitly asked (`install` / `patch`);
 - keeps no game assets or bytecode in the repository;
 - tracks the Steam Cloud hazard on the save file, since this title syncs `slot_1.lua`.
+
+The scope is deliberately file-level: there is no operation-level undo, no change journal and no
+bundle rollback. What that costs is recorded in
+[§15.4](KRCHEAT_FOUNDATION.md#154-what-we-deliberately-accept).

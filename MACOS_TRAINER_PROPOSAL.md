@@ -8,6 +8,20 @@
 > — with the full persistence model, runtime contract, CLI contract, safety model and open
 > questions — is [`KRCHEAT_FOUNDATION.md`](KRCHEAT_FOUNDATION.md). Where the two disagree, the
 > foundation document wins.
+>
+> **Divergences after the review of 2026-09-16** (foundation §2.1, D1–D8):
+>
+> * §4.1 here describes the save codec as a parser/emitter pair. It is now specified as
+>   **lossless**: untouched bytes are re-emitted verbatim (D1, foundation §12).
+> * §6 here specifies "timestamped backup before every write". It is now **one snapshot per
+>   command run** (D6, foundation §15.2), and the safety model is file-level only.
+> * §4.2 here treats Transport A as the general answer and Transport B as the fallback. If
+>   spike S2 passes, **Transport B becomes the simpler one** — a single generated file in the
+>   save directory (D3, foundation §9.8).
+> * §4.3 here presents the bytecode patcher as an optional stretch goal. It is now **backlog**,
+>   expected to be unnecessary (foundation §14).
+> * No GUI is proposed here; a **tkinter wrapper** over the shared core was added (F16,
+>   foundation §9.5).
 
 ---
 
